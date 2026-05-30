@@ -743,33 +743,41 @@ def ingest_doh2020_directory(
 
 
 # =============================================================================
-# SECTION 7 — Test Execution Main Loop
+# SECTION 7 — Production JSONL Export
 # =============================================================================
-# In TEST MODE (the defaults below) the script:
-#   • Processes only the first MAX_FILES_PER_DATASET CSV files per dataset
-#   • Reads only the first MAX_ROWS_PER_FILE data rows from each file
-#   • Prints every validated UnifiedSecurityLog as indented JSON to stdout
+# Streams every validated UnifiedSecurityLog record as a flat JSON line into a
+# single .jsonl file.  Downstream AI agents can read the file line-by-line
+# without loading it entirely into memory.
 #
-# To run a full production ingest, set both limits to None.
+# JSONL format rules:
+#   • Each line is a complete, self-contained JSON object (no indentation).
+#   • Lines are terminated with "\n".
+#   • The file contains NO commas or wrapping array brackets — one record
+#     per line is the entire contract.  Agents call json.loads(line) per row.
 # =============================================================================
 
 if __name__ == "__main__":
 
     # ─────────────────────────────────────────────────────────────────────────
-    # CONFIGURE: Replace these paths with your actual dataset directories.
-    # Both may reside on the same storage volume or separate mounts.
+    # Dataset source directories (unchanged from test config)
     # ─────────────────────────────────────────────────────────────────────────
     DIR_IDS2018: Path = Path("/Volumes/Expansion/CyberML_Dataset/archive")
     DIR_DOH2020: Path = Path("/Volumes/Expansion/CyberML_Dataset/CSVs/Total_CSVs")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # TEST-MODE LIMITS
-    # MAX_FILES_PER_DATASET = 2    → read the first 2 *.csv files per dataset
-    # MAX_ROWS_PER_FILE     = 5    → read the first 5 data rows per file
-    # Set either to None for a full production ingest (no limits).
+    # Output file — all records from both datasets land here sequentially.
+    # Agents read it with:  for line in open(path): record = json.loads(line)
     # ─────────────────────────────────────────────────────────────────────────
-    MAX_FILES_PER_DATASET: int = 2
-    MAX_ROWS_PER_FILE:     int = 5
+    OUTPUT_JSONL: Path = Path(
+        "/Users/rahulmac/Documents/Projects/projects/cyberML/unified_network_logs.jsonl"
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PRODUCTION MODE — remove all limits.
+    # Swap back to integers (e.g. 2 / 5) to re-enter test mode at any time.
+    # ─────────────────────────────────────────────────────────────────────────
+    MAX_FILES_PER_DATASET: Optional[int] = None   # all CSV files
+    MAX_ROWS_PER_FILE:     Optional[int] = None   # all rows per file
 
     _SEP  = "═" * 72
     _THIN = "─" * 72
@@ -778,50 +786,72 @@ if __name__ == "__main__":
     print("  PHASE 1 — DATA CONTRACTS & INGESTION ENGINE")
     print("  Autonomous Multi-Agent Threat Intelligence System")
     print(_THIN)
-    print(f"  Mode          : TEST (limits active)")
-    print(f"  File cap      : {MAX_FILES_PER_DATASET} CSV file(s) per dataset")
-    print(f"  Row cap       : {MAX_ROWS_PER_FILE} row(s) per file")
+    print(f"  Mode          : PRODUCTION  (no file or row limits)")
     print(f"  IDS2018 dir   : {DIR_IDS2018.resolve()}")
     print(f"  DoH2020  dir  : {DIR_DOH2020.resolve()}")
+    print(f"  Output JSONL  : {OUTPUT_JSONL}")
     print(_SEP)
 
-    # ── CIC-IDS2018 ──────────────────────────────────────────────────────────
-    print("\n▶  CIC-IDS2018 — Validated UnifiedSecurityLog Records")
-    print(_THIN)
+    # Guarantee the output directory exists before opening the file for write.
+    # parents=True handles deeply nested paths; exist_ok=True is idempotent.
+    OUTPUT_JSONL.parent.mkdir(parents=True, exist_ok=True)
 
-    ids_total = 0
-    for log_record in ingest_ids2018_directory(
-        DIR_IDS2018,
-        file_limit=MAX_FILES_PER_DATASET,
-        row_limit_per_file=MAX_ROWS_PER_FILE,
-    ):
-        print(log_record.model_dump_json(indent=2))
+    ids_total: int = 0
+    doh_total: int = 0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Single shared file handle — both dataset loops write into the same file
+    # sequentially.  The context manager guarantees the file is flushed and
+    # closed cleanly even if an unhandled exception aborts the pipeline.
+    #
+    # buffering=-1 (default) lets the OS choose an efficient write-buffer size,
+    # typically 8 KB.  For extreme throughput you can raise it explicitly:
+    #   open(..., buffering=1 << 20)   # 1 MB write buffer
+    # ─────────────────────────────────────────────────────────────────────────
+    with open(OUTPUT_JSONL, "w", encoding="utf-8") as out_file:
+
+        # ── CIC-IDS2018 ──────────────────────────────────────────────────────
+        print("\n▶  CIC-IDS2018 — Streaming records to JSONL …")
         print(_THIN)
-        ids_total += 1
 
-    print(f"\n  ✔  IDS2018 records emitted : {ids_total}")
+        for log_record in ingest_ids2018_directory(
+            DIR_IDS2018,
+            file_limit=MAX_FILES_PER_DATASET,
+            row_limit_per_file=MAX_ROWS_PER_FILE,
+        ):
+            out_file.write(log_record.model_dump_json() + "\n")
+            ids_total += 1
 
-    # ── CIC-DoHBrw-2020 ──────────────────────────────────────────────────────
-    print("\n▶  CIC-DoHBrw-2020 — Validated UnifiedSecurityLog Records")
-    print(_THIN)
+        print(f"\n  ✔  IDS2018 records written to file : {ids_total:,}")
 
-    doh_total = 0
-    for log_record in ingest_doh2020_directory(
-        DIR_DOH2020,
-        file_limit=MAX_FILES_PER_DATASET,
-        row_limit_per_file=MAX_ROWS_PER_FILE,
-    ):
-        print(log_record.model_dump_json(indent=2))
+        # ── CIC-DoHBrw-2020 ──────────────────────────────────────────────────
+        print("\n▶  CIC-DoHBrw-2020 — Streaming records to JSONL …")
         print(_THIN)
-        doh_total += 1
 
-    print(f"\n  ✔  DoH2020 records emitted : {doh_total}")
+        for log_record in ingest_doh2020_directory(
+            DIR_DOH2020,
+            file_limit=MAX_FILES_PER_DATASET,
+            row_limit_per_file=MAX_ROWS_PER_FILE,
+        ):
+            out_file.write(log_record.model_dump_json() + "\n")
+            doh_total += 1
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+        print(f"\n  ✔  DoH2020 records written to file : {doh_total:,}")
+
+    # out_file is closed and fully flushed here — safe for agents to open it.
+
+    # ── Final summary ─────────────────────────────────────────────────────────
     print()
     print(_SEP)
     print(f"  PIPELINE COMPLETE")
-    print(f"  Total validated records  :  {ids_total + doh_total}")
-    print(f"    IDS2018                :  {ids_total}")
-    print(f"    DoH2020                :  {doh_total}")
+    print(f"  Total records written    :  {ids_total + doh_total:,}")
+    print(f"    IDS2018                :  {ids_total:,}")
+    print(f"    DoH2020                :  {doh_total:,}")
+    print(f"  Output file              :  {OUTPUT_JSONL}")
+    print(f"  File size                :  ", end="")
+    try:
+        size_mb = OUTPUT_JSONL.stat().st_size / (1024 ** 2)
+        print(f"{size_mb:,.1f} MB")
+    except OSError:
+        print("(could not read)")
     print(_SEP)
