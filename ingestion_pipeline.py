@@ -614,7 +614,8 @@ def _resolve_csv_files(directory: Path, file_limit: Optional[int]) -> list[Path]
         logger.error("Path is not a directory : %s", directory)
         return []
 
-    files = sorted(directory.glob("*.csv"))
+    # Filter out macOS metadata files (._filename) from external drives
+    files = sorted([f for f in directory.glob("*.csv") if not f.name.startswith("._")])
 
     if not files:
         logger.warning("No *.csv files found in : %s", directory)
