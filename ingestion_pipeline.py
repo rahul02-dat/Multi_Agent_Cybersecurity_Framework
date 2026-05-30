@@ -1,947 +1,826 @@
 #!/usr/bin/env python3
 """
-================================================================================
- ingestion_pipeline.py
- Unified Security Log Ingestion Pipeline — Phase 1: Data Contracts & Ingestion
-================================================================================
- System  : Autonomous Multi-Agent Threat Intelligence System
- Version : 1.0.0
-
- Supported Datasets
- ──────────────────
-   • CIC-IDS2018      Macro network attack flows (DDoS, Brute Force, PortScan…)
-                      https://www.unb.ca/cic/datasets/ids-2018.html
-   • CIC-DoHBrw-2020  DNS-over-HTTPS tunneling / covert channel anomalies
-                      https://www.unb.ca/cic/datasets/dohbrw-2020.html
-
- Architecture Overview
- ─────────────────────
-   CSV files (GB-scale)
-       │
-       ▼  pd.read_csv(chunksize=N)           ← memory-safe lazy streaming
-   [ Raw Chunk: pd.DataFrame ]
-       │
-       ▼  _process_chunk()
-       ├─ [Stage 1] Strip column-header whitespace    ← fixes CIC hidden-space headers
-       ├─ [Stage 2] Replace ±inf → NaN → 0 (numeric)  ← bulk per-column sanitization
-       ├─ [Stage 3] parse_ids2018_row / parse_doh2020_row  ← per-row translation
-       └─ [Stage 4] UnifiedSecurityLog(**mapped)           ← Pydantic v2 validation
-               │
-               ├── PASS → appended to output list
-               └── FAIL → exact error logged to stderr; row dropped; loop continues
-
- Requirements
- ────────────
-   pip install "pandas>=1.3.0" "pydantic>=2.0.0"
-================================================================================
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 1: DATA CONTRACTS & INGESTION ENGINE                                 ║
+║  Autonomous Multi-Agent Threat Intelligence System                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Processes CIC-IDS2018 and CIC-DoHBrw-2020 cybersecurity datasets from      ║
+║  directories of partitioned CSVs, cleanses messy/corrupt records, and       ║
+║  normalises each row into a unified Pydantic v2 JSON data contract.          ║
+║                                                                              ║
+║  Architecture:                                                               ║
+║    Section 0 ── Logging Configuration                                        ║
+║    Section 1 ── Pipeline Constants & Column Alias Maps                       ║
+║    Section 2 ── Unified Data Contract  (Pydantic v2 BaseModel)               ║
+║    Section 3 ── Row-level Sanitisation Helpers                               ║
+║    Section 4 ── Translation Layer  (dataset-specific mapper functions)       ║
+║    Section 5 ── Memory-Safe CSV Chunk Streamer  (generator)                  ║
+║    Section 6 ── Dataset-level Ingestion Pipelines  (directory traversal)     ║
+║    Section 7 ── Test Execution Main Loop                                     ║
+║                                                                              ║
+║  Dependencies:  pip install pandas pydantic                                  ║
+║  Tested with:   pandas >= 1.4, pydantic >= 2.0                               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-from __future__ import annotations  # PEP 563: postponed annotation evaluation
+from __future__ import annotations
 
-import csv
+# ── Standard Library ──────────────────────────────────────────────────────────
 import math
 import sys
 import logging
-import random
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Generator, Literal, Optional
 
+# ── Third-Party ───────────────────────────────────────────────────────────────
 import pandas as pd
-import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field, field_validator, ValidationError
 
 
-# ── Library version guards ────────────────────────────────────────────────────
-# Fail immediately with an actionable message rather than a cryptic AttributeError
-# deep inside the application later.
-if int(pydantic.VERSION.split(".")[0]) < 2:
-    raise RuntimeError(
-        f"Pydantic ≥ 2.0 required (found {pydantic.VERSION}). "
-        "Upgrade: pip install 'pydantic>=2.0.0'"
-    )
+# =============================================================================
+# SECTION 0 — Logging Configuration
+# =============================================================================
+# Two independent log streams:
+#   • stdout  → INFO-level pipeline progress (file traversal, chunk counts)
+#   • stderr  → WARNING-level per-row validation failures (corrupted records)
+#
+# This lets operators pipe stdout to a log file and stderr to an alert sink
+# (e.g. PagerDuty webhook) without mixing concerns.
+# =============================================================================
 
-_pd_ver = tuple(int(x) for x in pd.__version__.split(".")[:2])
-if _pd_ver < (1, 3):
-    raise RuntimeError(
-        f"pandas ≥ 1.3.0 required (found {pd.__version__}). "
-        "Upgrade: pip install 'pandas>=1.3.0'"
-    )
+_LOG_FORMAT = "%(asctime)s [%(levelname)-8s] %(name)s | %(message)s"
+_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
 
-# ── Structured logging — all diagnostics go to stderr, never stdout ───────────
-# stdout stays clean for piped JSON output; stderr carries operational telemetry.
 logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.WARNING,      # Change to logging.DEBUG for verbose chunk tracing
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
+    stream=sys.stdout,
+    level=logging.INFO,
+    format=_LOG_FORMAT,
+    datefmt=_DATE_FORMAT,
 )
-log = logging.getLogger("threat_intel.ingestion")
 
-# ── Module-level constants ────────────────────────────────────────────────────
-CHUNK_SIZE: int = 10_000  # Rows per streaming chunk.
-                           # Rule of thumb: target ~50 MB/chunk.
-                           # 10 000 rows × ~5 KB/row ≈ 50 MB. Tune per env.
+# Dedicated validation-error logger that writes exclusively to stderr
+_val_logger = logging.getLogger("validation.stderr")
+_val_logger.propagate = False  # ← never bubble up to the root stdout handler
 
-# IANA transport-layer protocol number → canonical name.
-# Only TCP and UDP are first-class citizens in our contract; everything else
-# maps to "Unknown" so the field always satisfies the Literal constraint.
-# Source: https://www.iana.org/assignments/protocol-numbers/
-IDS2018_PROTO_MAP: dict[int, str] = {
-    0:   "Unknown",   # HOPOPT / undefined
-    1:   "Unknown",   # ICMP  (not TCP/UDP; maps to Unknown)
-    6:   "TCP",
-    17:  "UDP",
-    41:  "Unknown",   # IPv6-in-IPv4 encapsulation
-    58:  "Unknown",   # ICMPv6
-    132: "Unknown",   # SCTP
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setLevel(logging.WARNING)
+_stderr_handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT))
+_val_logger.addHandler(_stderr_handler)
+_val_logger.setLevel(logging.WARNING)
+
+logger = logging.getLogger("ingestion_engine")
+
+
+# =============================================================================
+# SECTION 1 — Pipeline Constants & Column Alias Maps
+# =============================================================================
+# CHUNK_SIZE   Controls memory footprint: a 10 000-row chunk of 80-column
+#              float data occupies roughly 6–8 MB before sanitisation.
+#              Reduce on constrained nodes; increase for throughput on RAM-rich
+#              workers.
+#
+# US_PER_SECOND  Unit-conversion multiplier: DoH2020 stores duration in seconds
+#                (float); IDS2018 stores it in microseconds (int).  We always
+#                emit microseconds in the unified schema.
+#
+# Column alias maps provide resilience against minor header variations across
+# dataset partitions (e.g. "Flow Byts/s" vs "Flow Bytes/s").  Each key is an
+# internal logical field name; values are ordered lists tried left-to-right.
+# =============================================================================
+
+CHUNK_SIZE:    int = 10_000       # Rows per Pandas read_csv chunk
+US_PER_SECOND: int = 1_000_000   # µs/s – DoH duration conversion factor
+
+# ── IDS2018: numeric protocol code → canonical label ─────────────────────────
+# IANA-assigned transport protocol numbers that appear in CIC-IDS2018.
+# All other values map to "Unknown".
+_IDS_PROTO_MAP: dict[int, str] = {
+    6:  "TCP",   # IANA RFC 793
+    17: "UDP",   # IANA RFC 768
 }
 
-# Type alias — used in function signatures for readability and mypy narrowing.
-DatasetType = Literal["IDS2018", "DoH2020"]
+# ── IDS2018: column alias resolution map ─────────────────────────────────────
+# CICFlowMeter output varies slightly across dataset release versions.
+# Headers are searched in priority order (index 0 first).
+_IDS_COLS: dict[str, list[str]] = {
+    "timestamp":        ["Timestamp",        "timestamp",      "Time"],
+    "src_port":         ["Src Port",         "Source Port",    "SrcPort",   "src_port"],
+    "dst_port":         ["Dst Port",         "Destination Port","DstPort",  "dst_port"],
+    "flow_duration":    ["Flow Duration",    "FlowDuration",   "Duration_us"],
+    "bytes_per_sec":    ["Flow Byts/s",      "Flow Bytes/s",   "FlowBytes/s",
+                         "Bwd Byts/s",       "Fwd Byts/s"],
+    "packets_per_sec":  ["Flow Pkts/s",      "Flow Packets/s", "FlowPackets/s",
+                         "Fwd Pkts/s",       "Bwd Pkts/s"],
+    "protocol":         ["Protocol",         "protocol"],
+    "label":            ["Label",            "label",          "Class"],
+}
+
+# ── DoH2020: column alias resolution map ─────────────────────────────────────
+# CIC-DoHBrw-2020 uses a behavioural-feature schema quite different from
+# CICFlowMeter; column name casing also differs across published splits.
+_DOH_COLS: dict[str, list[str]] = {
+    "timestamp":        ["TimeStamp",        "Timestamp",      "timestamp"],
+    "src_port":         ["SourcePort",       "Src Port",       "SrcPort",   "source_port"],
+    "dst_port":         ["DestinationPort",  "Dst Port",       "DstPort",   "destination_port"],
+    "duration":         ["Duration",         "duration",       "FlowDuration_s"],
+    "pkt_count":        ["PacketCount",      "packetcount",    "NPackets"],
+    "pkt_len_mean":     ["PacketLengthMean", "MeanPacketLength","pktLenMean"],
+    "flow_bytes_sent":  ["FlowBytesSent",    "BytesSent",      "TotalBytes"],
+    "label":            ["Label",            "label",          "Class",     "category"],
+}
+
+# Valid canonical protocol strings accepted by the Pydantic Literal field
+_VALID_PROTOCOLS = frozenset({"TCP", "UDP", "Unknown"})
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 1 — UNIFIED DATA CONTRACT (Pydantic v2)                           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+# =============================================================================
+# SECTION 2 — Unified Data Contract  (Pydantic v2)
+# =============================================================================
+# UnifiedSecurityLog is the single source of truth for every downstream
+# consumer (vector store, SIEM forwarder, ML feature extractor, etc.).
+# It hides all structural and unit differences between IDS2018 and DoH2020
+# behind a stable, validated interface.
+#
+# Design decisions:
+#   • Literal["IDS2018", "DoH2020"]  → compile-time provenance tracking
+#   • flow_duration as int (µs)       → lossless integer arithmetic for
+#                                       downstream time-window aggregation
+#   • ge/le constraints on ports      → enforced by Pydantic, no manual checks
+#   • ge=0 on floats                  → negative bps/pps is physically impossible
+#   • All "before" validators run on  → raw input before type coercion, so they
+#                                       handle str/float/None/nan/inf safely
+# =============================================================================
 
 class UnifiedSecurityLog(BaseModel):
     """
-    Canonical, immutable data contract for all ingested security network flows.
+    Canonical network-flow security log record.
 
-    This model is the single source of truth consumed by every downstream
-    system: feature pipelines, ML inference engines, SIEM alert rules, and
-    the data lake write path.
+    Abstracts structural differences between CIC-IDS2018 (CICFlowMeter-based,
+    flow-level features, µs durations) and CIC-DoHBrw-2020 (DNS-over-HTTPS
+    behavioural features, second-level durations).
 
-    Design Decisions
-    ─────────────────
-    • `extra="forbid"` — mapper bugs (extra/misspelled keys) surface immediately
-      at development time as ValidationErrors rather than silently being ignored.
-    • `str_strip_whitespace=True` — handles any residual leading/trailing spaces
-      that survived earlier normalization.
-    • `strict=False` — allows safe numeric coercions (int 0 → float 0.0) while
-      still rejecting structurally invalid values (e.g., "abc" for a port).
-
-    Field Invariants (guaranteed post-validation by Pydantic constraints)
-    ─────────────────────────────────────────────────────────────────────
-    • flow_duration      always in microseconds (μs);  ge=0
-    • source_port        always in [0, 65535]
-    • destination_port   always in [0, 65535]
-    • bytes_per_second   always ≥ 0.0
-    • packets_per_second always ≥ 0.0
-    • protocol           always one of "TCP" | "UDP" | "Unknown"
-    • ground_truth_label always a non-empty string (min_length=1)
+    Every field is defensively coerced: NaN/inf/None → zero; empty strings →
+    "UNKNOWN"; out-of-range ports → clamped.  A record that reaches this model
+    will ALWAYS serialise to valid JSON.
     """
 
-    model_config = ConfigDict(
-        str_strip_whitespace=True,  # Strip residual spaces from all string values
-        extra="forbid",             # Fail loudly on unexpected mapper output keys
-        strict=False,               # Allow safe numeric coercions only
+    source_dataset:     Literal["IDS2018", "DoH2020"] = Field(
+        ...,
+        description="Origin dataset tag; never inferred — always set by the mapper."
     )
-
-    source_dataset: Literal["IDS2018", "DoH2020"] = Field(
-        description="Originating dataset identifier — used for lineage tracking."
+    timestamp:          str = Field(
+        ...,
+        description="Original timestamp string from the dataset; format varies by source."
     )
-    timestamp: str = Field(
-        description="ISO 8601 timestamp string, UTC-normalized where the source "
-                    "format permits."
+    protocol:           Literal["TCP", "UDP", "Unknown"] = Field(
+        ...,
+        description="Layer-4 transport protocol.  IDS2018 maps numeric codes; "
+                    "DoH2020 defaults to TCP (HTTPS transport)."
     )
-    protocol: Literal["TCP", "UDP", "Unknown"] = Field(
-        description="Transport-layer protocol. Mapped from raw integer codes or "
-                    "inferred from context (e.g., DoH always uses TCP)."
-    )
-    flow_duration: int = Field(
+    flow_duration:      int = Field(
+        ...,
         ge=0,
-        description="Bidirectional flow lifetime in microseconds (μs). "
-                    "All source duration units are converted to this standard."
+        description="Network flow duration in microseconds.  "
+                    "IDS2018: pass-through.  DoH2020: converted from seconds."
     )
-    source_port: int = Field(
-        ge=0, le=65535,
-        description="Layer-4 source port number in the valid range [0, 65535]."
-    )
-    destination_port: int = Field(
-        ge=0, le=65535,
-        description="Layer-4 destination port number in the valid range [0, 65535]."
-    )
-    bytes_per_second: float = Field(
+    source_port:        int = Field(..., ge=0, le=65535)
+    destination_port:   int = Field(..., ge=0, le=65535)
+    bytes_per_second:   float = Field(
+        ...,
         ge=0.0,
-        description="Bidirectional flow throughput in bytes/second."
+        description="Throughput in bytes/second.  "
+                    "IDS2018: Flow Byts/s.  DoH2020: derived from pkt_len_mean × pps."
     )
     packets_per_second: float = Field(
+        ...,
         ge=0.0,
-        description="Bidirectional flow rate in packets/second."
+        description="Throughput in packets/second.  "
+                    "IDS2018: Flow Pkts/s.  DoH2020: PacketCount ÷ Duration."
     )
     ground_truth_label: str = Field(
-        min_length=1,
-        description="Human-readable attack or benign classification from the "
-                    "source dataset labelling scheme."
+        ...,
+        description="Original dataset classification label (e.g. 'BENIGN', 'DoS', 'DoH')."
     )
 
+    # ── Field validators (mode='before' → run on raw input before coercion) ──
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 2 — SANITIZATION UTILITIES                                        ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+    @field_validator("source_port", "destination_port", mode="before")
+    @classmethod
+    def _coerce_port(cls, v: object) -> int:
+        """
+        Coerce any port-like value to a valid integer in [0, 65535].
+        NaN / inf / None → 0.  Values above 65535 are clamped (not rejected),
+        because some CIC dataset rows carry mis-formatted port strings.
+        """
+        try:
+            f = float(v)                          # type: ignore[arg-type]
+            return min(65535, max(0, int(f))) if math.isfinite(f) else 0
+        except (TypeError, ValueError):
+            return 0
 
-def _is_float_sentinel(value: object) -> bool:
+    @field_validator("flow_duration", mode="before")
+    @classmethod
+    def _coerce_duration(cls, v: object) -> int:
+        """Coerce flow duration to a non-negative integer (microseconds)."""
+        try:
+            f = float(v)                          # type: ignore[arg-type]
+            return max(0, int(f)) if math.isfinite(f) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    @field_validator("bytes_per_second", "packets_per_second", mode="before")
+    @classmethod
+    def _coerce_rate(cls, v: object) -> float:
+        """
+        Coerce throughput rate to a non-negative finite float.
+        The CIC-IDS2018 dataset is notorious for inf values in Flow Byts/s
+        (caused by zero-duration flows); these are silently normalised to 0.0.
+        """
+        try:
+            f = float(v)                          # type: ignore[arg-type]
+            return max(0.0, f) if math.isfinite(f) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @field_validator("timestamp", "ground_truth_label", mode="before")
+    @classmethod
+    def _coerce_str(cls, v: object) -> str:
+        """Strip and coerce any string-like value; replace nullish values with 'UNKNOWN'."""
+        if v is None or (isinstance(v, float) and not math.isfinite(v)):
+            return "UNKNOWN"
+        cleaned = str(v).strip()
+        return cleaned if cleaned else "UNKNOWN"
+
+    @field_validator("protocol", mode="before")
+    @classmethod
+    def _normalise_protocol(cls, v: object) -> str:
+        """
+        Accept 'TCP', 'UDP', or 'Unknown' (case-insensitive); reject everything else
+        by falling back to 'Unknown'.  Numeric codes must be resolved BEFORE this
+        validator runs (done inside the mapper functions, not here).
+        """
+        if isinstance(v, str):
+            upper = v.strip().upper()
+            if upper in _VALID_PROTOCOLS:
+                return upper
+        return "Unknown"
+
+
+# ── Required when `from __future__ import annotations` is active ──────────────
+# PEP 563 defers all annotation evaluation to strings; Pydantic v2 must be
+# explicitly told to re-resolve them against the current module namespace.
+UnifiedSecurityLog.model_rebuild()
+
+
+# =============================================================================
+# SECTION 3 — Row-level Sanitisation Helpers
+# =============================================================================
+# These small helpers are called by both mapper functions.  Keeping them at
+# module level (rather than inside the mappers) makes unit-testing trivial and
+# avoids repeated closure allocation inside hot loops.
+# =============================================================================
+
+def _pick(row: dict, aliases: list[str], default=None):
     """
-    Return True if *value* is a floating-point sentinel that is invalid in JSON
-    and would cause a Pydantic ValidationError: NaN, +inf, or -inf.
+    Return the value of the first matching alias key found in *row*.
+    Treats the value as missing if it is None; does NOT filter on 0 or "".
+
+    Args:
+        row:      Sanitised row dictionary.
+        aliases:  Ordered list of candidate column names to probe.
+        default:  Returned when no alias resolves to a non-None value.
     """
+    for alias in aliases:
+        if alias in row and row[alias] is not None:
+            return row[alias]
+    return default
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    """Parse *value* as a finite float; return *default* on failure."""
     try:
-        f = float(value)  # type: ignore[arg-type]
-        return math.isnan(f) or math.isinf(f)
+        f = float(value)                          # type: ignore[arg-type]
+        return f if math.isfinite(f) else default
     except (TypeError, ValueError):
-        return False
+        return default
 
 
-def sanitize_float(value: object, default: float = 0.0) -> float:
-    """
-    Coerce *value* to a finite Python float.
+def _safe_int(value: object, default: int = 0) -> int:
+    """Parse *value* as an integer; return *default* on NaN/inf/parse failure."""
+    try:
+        f = float(value)                          # type: ignore[arg-type]
+        return int(f) if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
 
-    Safely handles: None, NaN, ±inf, empty string, non-numeric strings,
-    and any type for which float() raises TypeError or ValueError.
-    All unrepresentable inputs collapse to *default* (0.0 by contract).
 
-    This is the authoritative numeric coercion function used throughout.
-    All other numeric helpers (sanitize_int, clamp_port) delegate to this.
-    """
+def _safe_str(value: object, default: str = "UNKNOWN") -> str:
+    """Strip *value* to a non-empty string; return *default* for nullish input."""
     if value is None:
         return default
-    try:
-        f = float(value)  # type: ignore[arg-type]
-        return default if (math.isnan(f) or math.isinf(f)) else f
-    except (TypeError, ValueError):
-        return default
+    s = str(value).strip()
+    return s if s else default
 
 
-def sanitize_int(value: object, default: int = 0) -> int:
+def _sanitize_row_dict(row: dict) -> dict:
     """
-    Coerce *value* to a Python int via safe float parsing, then truncation.
-    Delegates all edge-case handling to sanitize_float — never duplicates logic.
+    Global pre-sanitisation pass over an entire row dictionary.
+
+    Replaces every non-finite float (NaN, +inf, -inf) and Python None
+    with integer 0 so that downstream JSON serialisation never encounters
+    values that are illegal in the JSON spec.
+
+    This acts as a broad safety net *before* the dataset-specific mappers
+    run, catching any column the mappers do not explicitly handle.
+
+    Args:
+        row: Raw dict from pd.Series.to_dict() — may contain numpy scalar types.
+
+    Returns:
+        New dict with the same keys; non-finite / None values replaced with 0.
     """
-    return int(sanitize_float(value, float(default)))
+    clean: dict = {}
+    for key, val in row.items():
+        if val is None:
+            clean[key] = 0
+        elif isinstance(val, float) and not math.isfinite(val):
+            clean[key] = 0
+        else:
+            clean[key] = val
+    return clean
 
 
-def sanitize_str(value: object, default: str = "UNKNOWN") -> str:
-    """
-    Coerce *value* to a non-empty, stripped Python str.
-
-    Critical correctness: float NaN / ±inf yield *default*, NOT the strings
-    "nan" / "inf". pandas represents missing string cells as float NaN, so
-    this case is extremely common in real CIC CSVs.
-    """
-    if value is None:
-        return default
-    if _is_float_sentinel(value):
-        return default
-    result = str(value).strip()
-    return result if result else default
-
-
-def clamp_port(value: object) -> int:
-    """
-    Convert *value* to a valid TCP/UDP port number in [0, 65535].
-
-    Values outside the valid range are *clamped* (not rejected) to preserve
-    row utility. A port of 70000 is almost certainly a float precision artefact;
-    discarding the entire row over it would lose all other valid signal.
-    """
-    return max(0, min(65535, sanitize_int(value, 0)))
-
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 3 — DATASET-SPECIFIC TRANSLATION LAYERS                           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+# =============================================================================
+# SECTION 4 — Translation Layer  (Dataset-Specific Mapper Functions)
+# =============================================================================
+# Each mapper accepts a *sanitised* row dict and returns a plain dict of kwargs
+# ready for UnifiedSecurityLog(**kwargs).
+#
+# Mappers are the ONLY place where dataset-specific column names, unit
+# conversions, and protocol mappings live.  The Pydantic model is kept
+# dataset-agnostic; new data sources only require a new mapper function.
+# =============================================================================
 
 def parse_ids2018_row(row: dict) -> dict:
     """
-    Translate one CIC-IDS2018 flow record into a UnifiedSecurityLog field dict.
+    Translate one sanitised CIC-IDS2018 row into a UnifiedSecurityLog kwarg dict.
 
-    ┌─────────────────────────────────────────────────────────────────────────┐
-    │ CIC-IDS2018 Quirk Register — all dataset-specific issues resolved here  │
-    ├─────────────────────────────────────────────────────────────────────────┤
-    │ Q1. Column headers contain leading/trailing spaces in the raw CSV.      │
-    │     E.g., " Dst Port " instead of "Dst Port".                           │
-    │     → Stripped at chunk level (Stage 1 of _process_chunk) before this  │
-    │       function is ever called. Belt-and-suspenders: we also try         │
-    │       alternative spellings via chained .get() fallbacks.               │
-    │                                                                         │
-    │ Q2. `Protocol` is an IANA integer code, NOT a string.                  │
-    │     6 = TCP, 17 = UDP, everything else = "Unknown" per our contract.   │
-    │     → Mapped through IDS2018_PROTO_MAP at the module level.             │
-    │                                                                         │
-    │ Q3. `Timestamp` uses the non-ISO format "DD/MM/YYYY HH:MM:SS".         │
-    │     Day-first ordering is a silent correctness trap for US-locale tools.│
-    │     → Parsed with dayfirst=True; output as ISO 8601 string.             │
-    │     → On parse failure, the raw string is preserved (not zeroed).      │
-    │       Silent data loss is worse than a slightly malformed timestamp.    │
-    │                                                                         │
-    │ Q4. `Flow Duration` is already in microseconds per CICFlowMeter spec.  │
-    │     → Direct int cast; no unit conversion needed.                       │
-    │                                                                         │
-    │ Q5. No `Src Port` column in standard CIC-IDS2018 files.                │
-    │     The dataset is flow-feature-centric and omits L4 source ports.     │
-    │     → Defaults to 0; alternate spellings tried as a guard.              │
-    │                                                                         │
-    │ Q6. Throughput column uses CIC's famous typo "Flow Byts/s"             │
-    │     (not "Bytes"). Both spellings are tried; first non-None wins.      │
-    │                                                                         │
-    │ Q7. Flows with very short duration produce ±inf bytes/s after          │
-    │     CICFlowMeter's internal division. These are replaced with 0 by     │
-    │     the bulk chunk-level sanitization in Stage 2 of _process_chunk.    │
-    │     sanitize_float() provides an independent second defence layer.     │
-    └─────────────────────────────────────────────────────────────────────────┘
+    CIC-IDS2018 is generated by CICFlowMeter from the Canadian Institute for
+    Cybersecurity's PCAP captures.  Key schema characteristics:
+
+        Column          Type    Notes
+        ─────────────── ─────── ─────────────────────────────────────────────
+        Timestamp       str     "DD/MM/YYYY HH:MM:SS" (locale-dependent)
+        Protocol        int     6 → TCP, 17 → UDP, others → "Unknown"
+        Flow Duration   int     Already in microseconds — no conversion needed
+        Src Port        int     TCP/UDP source port; may be missing in some splits
+        Dst Port        int     TCP/UDP destination port
+        Flow Byts/s     float   Can be +inf when Flow Duration == 0; we clamp
+        Flow Pkts/s     float   Same inf risk as bytes/s
+        Label           str     "BENIGN", "DoS Hulk", "PortScan", etc.
 
     Args:
-        row: Single CSV row as a Python dict. Column headers must already be
-             stripped of whitespace (this is guaranteed by _process_chunk).
+        row: Pre-sanitised dict (all NaN/None/inf already replaced with 0).
+
     Returns:
-        Dict whose keys exactly match the fields of UnifiedSecurityLog.
+        Dict of keyword arguments for UnifiedSecurityLog(**...).
     """
-    # ── Q2: Protocol — integer IANA code → canonical string ──────────────────
-    raw_proto = sanitize_int(row.get("Protocol", 0), default=0)
-    protocol  = IDS2018_PROTO_MAP.get(raw_proto, "Unknown")
-
-    # ── Q3: Timestamp — "DD/MM/YYYY HH:MM:SS" → ISO 8601 ────────────────────
-    raw_ts = sanitize_str(row.get("Timestamp", ""), default="")
-    if raw_ts:
-        try:
-            # dayfirst=True is non-negotiable: 02/03/2018 is 2 March, not 3 Feb.
-            ts = pd.to_datetime(raw_ts, dayfirst=True).isoformat()
-        except Exception:
-            # Preserve the original string on failure. A downstream retry is
-            # better than silently replacing a real timestamp with epoch zero.
-            ts = raw_ts
-    else:
-        ts = "1970-01-01T00:00:00"  # Unix epoch sentinel for truly absent values.
-
-    # ── Q4: Flow Duration — already in microseconds ───────────────────────────
-    flow_dur = sanitize_int(row.get("Flow Duration", 0), default=0)
-
-    # ── Q5: Ports — Src Port may be absent in some IDS2018 file versions ──────
-    src_port = clamp_port(row.get("Src Port", row.get("Source Port", 0)))
-    dst_port = clamp_port(row.get("Dst Port", row.get("Destination Port", 0)))
-
-    # ── Q6: Throughput — tolerate both "Byts" (CIC typo) and "Bytes" ─────────
-    bps = sanitize_float(
-        row.get("Flow Byts/s",
-        row.get("Flow Bytes/s",
-        row.get("Flow Byts/S",       # Occasional capitalisation variant
-        0.0)))
-    )
-    pps = sanitize_float(
-        row.get("Flow Pkts/s",
-        row.get("Flow Packets/s",
-        row.get("Flow Pkts/S",
-        0.0)))
-    )
-
-    # ── Label — exact classification string from the dataset ──────────────────
-    label = sanitize_str(row.get("Label", ""), default="UNKNOWN")
+    # ── Protocol: numeric IANA code → canonical string ────────────────────────
+    # Non-standard / unrecognised codes → "Unknown" (not a hard failure).
+    raw_proto_int = _safe_int(_pick(row, _IDS_COLS["protocol"], default=0))
+    protocol_str  = _IDS_PROTO_MAP.get(raw_proto_int, "Unknown")
 
     return {
         "source_dataset":     "IDS2018",
-        "timestamp":          ts,
-        "protocol":           protocol,
-        "flow_duration":      flow_dur,
-        "source_port":        src_port,
-        "destination_port":   dst_port,
-        "bytes_per_second":   bps,
-        "packets_per_second": pps,
-        "ground_truth_label": label,
+        "timestamp":          _safe_str(_pick(row, _IDS_COLS["timestamp"])),
+        "protocol":           protocol_str,
+        # Flow Duration is already µs in IDS2018 → pass through as int
+        "flow_duration":      _safe_int(_pick(row, _IDS_COLS["flow_duration"])),
+        "source_port":        _safe_int(_pick(row, _IDS_COLS["src_port"])),
+        "destination_port":   _safe_int(_pick(row, _IDS_COLS["dst_port"])),
+        # Flow Byts/s and Flow Pkts/s can be ±inf for zero-duration flows;
+        # the Pydantic _coerce_rate validator will clamp them to 0.0.
+        "bytes_per_second":   _safe_float(_pick(row, _IDS_COLS["bytes_per_sec"])),
+        "packets_per_second": _safe_float(_pick(row, _IDS_COLS["packets_per_sec"])),
+        "ground_truth_label": _safe_str(_pick(row, _IDS_COLS["label"])),
     }
 
 
 def parse_doh2020_row(row: dict) -> dict:
     """
-    Translate one CIC-DoHBrw-2020 flow record into a UnifiedSecurityLog field dict.
+    Translate one sanitised CIC-DoHBrw-2020 row into a UnifiedSecurityLog kwarg dict.
 
-    ┌─────────────────────────────────────────────────────────────────────────┐
-    │ CIC-DoHBrw-2020 Quirk Register — all dataset-specific issues resolved  │
-    ├─────────────────────────────────────────────────────────────────────────┤
-    │ Q1. No Protocol column exists anywhere in the DoH2020 schema.          │
-    │     DNS-over-HTTPS mandates TLS, which runs exclusively over TCP.      │
-    │     → Protocol is hardcoded to "TCP". No lookup required.              │
-    │                                                                         │
-    │ Q2. DestinationPort should always be 443 (HTTPS/TLS).                  │
-    │     Files can be malformed or the column missing; we enforce it.       │
-    │     → If DestinationPort is 0 or absent, it is set to 443.             │
-    │                                                                         │
-    │ Q3. `Duration` is in SECONDS (float), NOT microseconds.                │
-    │     CIC-IDS2018 uses microseconds; DoH2020 does not. This is the       │
-    │     most dangerous inter-dataset discrepancy for downstream ML.        │
-    │     → Multiplied by 1_000_000 before int() cast.                       │
-    │                                                                         │
-    │ Q4. Throughput is split into directional rate columns:                 │
-    │       FlowSentRate / FlowReceivedRate     (bytes/sec)                  │
-    │       PacketSentRate / PacketReceivedRate (packets/sec)                │
-    │     → Summed to produce bidirectional totals matching our contract.    │
-    │                                                                         │
-    │ Q5. Fallback: if explicit rate columns are zero or absent, derive      │
-    │     rates from raw byte/packet count columns divided by duration.      │
-    │     This covers older DoH2020 file versions with a different schema.  │
-    │                                                                         │
-    │ Q6. Timestamp column name varies across DoH2020 file versions:        │
-    │     "TimeStamp", "Timestamp", "timestamp". All three are tried.        │
-    │                                                                         │
-    │ Q7. Label column name varies: "Label", "label", "CLASS".               │
-    └─────────────────────────────────────────────────────────────────────────┘
+    CIC-DoHBrw-2020 captures DNS-over-HTTPS flows from multiple browsers and
+    DNS resolvers.  Key schema characteristics:
+
+        Column              Type    Notes
+        ─────────────────── ─────── ─────────────────────────────────────────
+        TimeStamp           str     ISO 8601 / epoch depending on split version
+        SourcePort          int     Ephemeral client port
+        DestinationPort     int     Almost always 443; defaults to 443 when 0
+        Duration            float   Seconds (NOT microseconds) → must convert
+        PacketCount         int     Total packets in the flow
+        PacketLengthMean    float   Mean payload size in bytes
+        FlowBytesSent       int     Total bytes (some splits only)
+        Label               str     "DoH", "NonDoH", "Malicious-*" etc.
+
+    Transformations applied:
+        1. duration (s)   →  flow_duration (µs):  int(duration × 1_000_000)
+        2. DestinationPort == 0  →  443  (DoH canonical HTTPS port)
+        3. Protocol               →  "TCP" by default (DoH runs over HTTPS/TCP);
+                                     overridden if a numeric Protocol column exists
+        4. bytes_per_second       →  FlowBytesSent / duration  OR
+                                     PacketLengthMean × packets_per_second
+        5. packets_per_second     →  PacketCount / duration (s)
 
     Args:
-        row: Single CSV row as a Python dict. Column headers must already be
-             stripped of whitespace (guaranteed by _process_chunk).
+        row: Pre-sanitised dict (all NaN/None/inf already replaced with 0).
+
     Returns:
-        Dict whose keys exactly match the fields of UnifiedSecurityLog.
+        Dict of keyword arguments for UnifiedSecurityLog(**...).
     """
-    # ── Q1: Protocol — DoH mandates TLS/HTTPS, therefore always TCP ──────────
-    protocol = "TCP"
+    # ── Duration: seconds (float) → microseconds (int) ───────────────────────
+    raw_duration_s = _safe_float(_pick(row, _DOH_COLS["duration"], default=0.0))
+    flow_duration_us = int(raw_duration_s * US_PER_SECOND)
 
-    # ── Q6: Timestamp — column name varies across DoH2020 file versions ───────
-    raw_ts = sanitize_str(
-        row.get("TimeStamp",
-        row.get("Timestamp",
-        row.get("timestamp", ""))),
-        default=""
-    )
-    if raw_ts:
-        try:
-            # pd.to_datetime handles the ISO-adjacent "YYYY-MM-DDTHH:MM:SS.ffffff"
-            # format natively with no extra configuration required.
-            ts = pd.to_datetime(raw_ts).isoformat()
-        except Exception:
-            ts = raw_ts
+    # ── Destination port: default to 443 (HTTPS) when absent or zero ─────────
+    raw_dst_port    = _safe_int(_pick(row, _DOH_COLS["dst_port"], default=0))
+    destination_port = raw_dst_port if raw_dst_port > 0 else 443
+
+    # ── packets_per_second: PacketCount ÷ Duration (guard against div/zero) ──
+    pkt_count        = _safe_float(_pick(row, _DOH_COLS["pkt_count"], default=0.0))
+    packets_per_sec  = (pkt_count / raw_duration_s) if raw_duration_s > 0.0 else 0.0
+
+    # ── bytes_per_second: prefer explicit field; fall back to derived value ───
+    # Priority:
+    #   1. FlowBytesSent / Duration          (most accurate)
+    #   2. PacketLengthMean × packets/s      (derived approximation)
+    #   3. 0.0                               (last-resort default)
+    flow_bytes_sent  = _safe_float(_pick(row, _DOH_COLS["flow_bytes_sent"], default=None))
+    pkt_len_mean     = _safe_float(_pick(row, _DOH_COLS["pkt_len_mean"], default=0.0))
+
+    if flow_bytes_sent is not None and raw_duration_s > 0.0:
+        bytes_per_sec = flow_bytes_sent / raw_duration_s
     else:
-        ts = "1970-01-01T00:00:00"
+        bytes_per_sec = pkt_len_mean * packets_per_sec
 
-    # ── Q3: Flow Duration — SECONDS (float) → MICROSECONDS (int) ─────────────
-    raw_dur_s = sanitize_float(row.get("Duration", 0.0), default=0.0)
-    flow_dur  = int(raw_dur_s * 1_000_000)
-
-    # ── Q2: Ports — enforce destination port 443 for DoH traffic ─────────────
-    src_port = clamp_port(row.get("SourcePort",      row.get("Source Port", 0)))
-    dst_port = clamp_port(row.get("DestinationPort", row.get("Destination Port", 0)))
-    if dst_port == 0:
-        dst_port = 443  # DoH MUST target 443; zero means the column was missing.
-
-    # ── Q4: Throughput — sum directional rates for bidirectional total ─────────
-    sent_rate = sanitize_float(
-        row.get("FlowSentRate",      row.get("flowSentRate",     0.0))
-    )
-    recv_rate = sanitize_float(
-        row.get("FlowReceivedRate",  row.get("flowReceivedRate", 0.0))
-    )
-    bps = sent_rate + recv_rate
-
-    pkt_sent  = sanitize_float(
-        row.get("PacketSentRate",     row.get("packetSentRate",     0.0))
-    )
-    pkt_recv  = sanitize_float(
-        row.get("PacketReceivedRate", row.get("packetReceivedRate", 0.0))
-    )
-    pps = pkt_sent + pkt_recv
-
-    # ── Q5: Fallback — derive from raw totals when rate columns are absent ─────
-    # Guards against older DoH2020 file schema variants that lack rate columns.
-    if bps == 0.0 and raw_dur_s > 0.0:
-        total_bytes = (
-            sanitize_float(row.get("FlowBytesSent",     row.get("flowBytesSent",     0.0)))
-            + sanitize_float(row.get("FlowBytesReceived", row.get("flowBytesReceived", 0.0)))
-        )
-        bps = total_bytes / raw_dur_s
-
-    if pps == 0.0 and raw_dur_s > 0.0:
-        total_pkts = (
-            sanitize_float(row.get("PacketsSent",     row.get("packetsSent",     0.0)))
-            + sanitize_float(row.get("PacketsReceived", row.get("packetsReceived", 0.0)))
-        )
-        pps = total_pkts / raw_dur_s
-
-    # ── Q7: Label — known values: "Benign", "Malicious", "NonDoH", "DoH" ──────
-    label = sanitize_str(
-        row.get("Label", row.get("label", row.get("CLASS", ""))),
-        default="UNKNOWN"
-    )
+    # ── Protocol: DoH runs over HTTPS (TCP/443) by definition ────────────────
+    # If the dataset happens to include a numeric Protocol column (some splits
+    # do), resolve it through the IANA map; otherwise default to TCP.
+    raw_proto_col = _pick(row, ["Protocol", "protocol"], default=None)
+    if raw_proto_col is not None:
+        proto_str = _IDS_PROTO_MAP.get(_safe_int(raw_proto_col), "TCP")
+    else:
+        proto_str = "TCP"
 
     return {
         "source_dataset":     "DoH2020",
-        "timestamp":          ts,
-        "protocol":           protocol,
-        "flow_duration":      flow_dur,
-        "source_port":        src_port,
-        "destination_port":   dst_port,
-        "bytes_per_second":   bps,
-        "packets_per_second": pps,
-        "ground_truth_label": label,
+        "timestamp":          _safe_str(_pick(row, _DOH_COLS["timestamp"])),
+        "protocol":           proto_str,
+        "flow_duration":      flow_duration_us,
+        "source_port":        _safe_int(_pick(row, _DOH_COLS["src_port"])),
+        "destination_port":   destination_port,
+        "bytes_per_second":   bytes_per_sec,
+        "packets_per_second": packets_per_sec,
+        "ground_truth_label": _safe_str(_pick(row, _DOH_COLS["label"])),
     }
 
 
-# ── Mapper Registry ───────────────────────────────────────────────────────────
-# Maps DatasetType → translation function.
-# Adding a new dataset requires: (1) write a new parse_*_row function, and
-# (2) add one entry here. Zero changes to the processing engine are needed.
-MAPPER_REGISTRY: dict[str, Callable[[dict], dict]] = {
-    "IDS2018": parse_ids2018_row,
-    "DoH2020": parse_doh2020_row,
-}
+# =============================================================================
+# SECTION 5 — Memory-Safe CSV Chunk Streamer
+# =============================================================================
+# A generator that wraps pd.read_csv(chunksize=N) to provide:
+#   • Guaranteed file closure (context manager)
+#   • Immediate header whitespace stripping on every chunk
+#   • Optional per-file row ceiling (development / test mode)
+#   • Graceful handling of empty files, missing files, encoding errors
+#
+# Memory guarantee: at any point in time only ONE chunk of CHUNK_SIZE rows
+# is alive in the interpreter heap; all other chunks have been GC'd.
+# =============================================================================
 
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 4 — CORE STREAM PROCESSING ENGINE                                 ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-def _process_chunk(
-    chunk: pd.DataFrame,
-    dataset_type: DatasetType,
-) -> tuple[list[UnifiedSecurityLog], int]:
+def stream_csv_chunks(
+    csv_path: Path,
+    chunk_size: int = CHUNK_SIZE,
+    row_limit: Optional[int] = None,
+) -> Generator[pd.DataFrame, None, None]:
     """
-    Run one pandas DataFrame chunk through the four-stage ingestion pipeline.
+    Memory-safe generator: stream a single CSV file in fixed-size chunks.
 
-    Stage 1 — Header normalisation
-        Strip leading/trailing whitespace from every column name.
-        Resolves CIC-IDS2018's notorious hidden-space headers like " Dst Port ".
-        Applied once per chunk (O(cols)), not per row (O(rows × cols)).
-
-    Stage 2 — Bulk numeric sanitisation
-        Replace ±inf with NaN, then fillna(0) — on NUMERIC columns only.
-        String columns are intentionally left untouched so that legitimate
-        string values (labels, IPs) are never silently zeroed.
-        The per-cell sanitize_* functions in the mapper provide a second,
-        independent defence layer for individual cells that slip through.
-
-    Stage 3 — Per-row translation
-        Apply the dataset-specific mapper function (looked up from MAPPER_REGISTRY)
-        to transform raw column names/values into the unified schema dictionary.
-
-    Stage 4 — Pydantic validation
-        Instantiate UnifiedSecurityLog from the mapped dict.
-        Any validation or mapping failure is ISOLATED to the current row:
-          • Error is logged to stderr with full type, message, and key context.
-          • The row is silently dropped from output.
-          • The loop continues with the next row — the pipeline never raises.
+    Opens the file, strips column-header whitespace, applies an optional row
+    ceiling, and automatically closes the file when the generator is exhausted
+    or garbage-collected.
 
     Args:
-        chunk:        Raw DataFrame chunk from pd.read_csv iterator.
-        dataset_type: Identifies which mapper function to apply.
+        csv_path:   Path object pointing to the target CSV file.
+        chunk_size: Number of rows per Pandas TextFileReader chunk.
+                    Tune this based on the node's RAM budget.
+                    Rule of thumb: 10 000 rows × 80 float cols ≈ 6–8 MB.
+        row_limit:  If set, stop yielding after this many total rows.
+                    Used in test/dev mode to avoid reading entire files.
 
-    Returns:
-        (validated_logs, n_failed) — counts feed accurate stream-level telemetry.
+    Yields:
+        pd.DataFrame — one chunk at a time, column headers already stripped.
+
+    Note:
+        ``pd.read_csv`` with ``chunksize`` returns a ``TextFileReader`` which
+        implements the context manager protocol (pandas >= 1.2).  Using it
+        inside a ``with`` block guarantees the underlying file descriptor is
+        closed even if an exception is raised mid-stream.
     """
-    # ── Stage 1: Normalise column headers ─────────────────────────────────────
-    # This single line resolves CIC's infamous hidden-space column names.
-    # Must run before the mapper functions attempt any column.get() lookups.
-    chunk.columns = pd.Index([str(c).strip() for c in chunk.columns])
-
-    # ── Stage 2: Bulk numeric sanitisation ────────────────────────────────────
-    # Only target dtype-numeric columns to avoid corrupting string columns.
-    numeric_cols = chunk.select_dtypes(include="number").columns.tolist()
-    if numeric_cols:
-        chunk[numeric_cols] = (
-            chunk[numeric_cols]
-            .replace([float("inf"), float("-inf")], float("nan"))
-            .fillna(0)
-        )
-
-    mapper_fn                            = MAPPER_REGISTRY[dataset_type]
-    validated: list[UnifiedSecurityLog]  = []
-    n_failed                             = 0
-
-    # ── Stages 3 + 4: Per-row translation and Pydantic validation ─────────────
-    for idx, series in chunk.iterrows():
-        raw: dict = series.to_dict()
-        try:
-            # Stage 3: dataset-specific field mapping
-            mapped: dict = mapper_fn(raw)
-
-            # Stage 4: Pydantic contract validation
-            log_entry = UnifiedSecurityLog(**mapped)
-            validated.append(log_entry)
-
-        except Exception as exc:
-            n_failed += 1
-            # Surface the EXACT error type and message to stderr.
-            # Dumping the first 10 keys provides debug context without
-            # flooding the log with potentially sensitive full row data.
-            log.warning(
-                "Row REJECTED | dataset=%-8s | row_index=%s | "
-                "error_type=%-30s | message=%s | first_10_columns=%s",
-                dataset_type,
-                idx,
-                type(exc).__name__,
-                str(exc),
-                list(raw.keys())[:10],
-            )
-
-    return validated, n_failed
-
-
-def stream_and_process(
-    file_path:    Path,
-    dataset_type: DatasetType,
-    chunk_size:   int           = CHUNK_SIZE,
-    row_limit:    Optional[int] = None,
-) -> list[UnifiedSecurityLog]:
-    """
-    Stream a gigabyte-scale CSV file in memory-safe chunks through the pipeline.
-
-    Memory Guarantee
-    ─────────────────
-    `pd.read_csv(chunksize=N)` returns a `TextFileReader` — a lazy iterator,
-    not an in-memory object. Each chunk (at most `chunk_size` rows) is fetched,
-    processed through the pipeline, and released to the garbage collector before
-    the next chunk is loaded. Peak heap usage is bounded to:
-        ≈ chunk_size × avg_row_bytes_in_memory
-    regardless of the total file size. A 10 GB CSV with chunk_size=10_000 never
-    requires more than ~50–100 MB of RAM for the active chunk.
-
-    Fault Isolation
-    ────────────────
-    Row-level failures are absorbed inside _process_chunk (never propagated).
-    File-level errors (not found, empty, encoding issues) are logged to stderr
-    and an empty list is returned. The caller is responsible for deciding whether
-    an empty result is a fatal error or an acceptable outcome.
-
-    Args:
-        file_path:    Path to the CSV dataset file on disk.
-        dataset_type: "IDS2018" or "DoH2020" — selects the mapper function.
-        chunk_size:   Rows per pandas chunk. See module-level CHUNK_SIZE notes.
-        row_limit:    Maximum total rows to process (None = entire file).
-                      Set to a small integer for smoke-testing without reading
-                      multi-GB files end-to-end.
-
-    Returns:
-        List of all validated UnifiedSecurityLog objects from this file.
-        Returns [] (does not raise) on any file-level error.
-    """
-    if not file_path.exists():
-        log.error("Dataset file not found — skipping: %s", file_path)
-        return []
-
-    all_logs:       list[UnifiedSecurityLog] = []
-    rows_consumed   = 0
-    rows_validated  = 0
-    rows_failed     = 0
-    chunk_count     = 0
-
-    # Log at WARNING so this header is visible at the default log level
-    # without requiring the caller to lower to DEBUG.
-    log.warning(
-        "STREAM START | file=%-55s | dataset=%-8s | chunk_size=%d | row_limit=%s",
-        file_path.name, dataset_type, chunk_size, row_limit or "unlimited",
-    )
+    rows_yielded: int = 0
 
     try:
-        # `low_memory=False` disables pandas' per-column dtype sniffing pass,
-        # which re-reads the file and is both slow and unreliable on CIC CSVs
-        # where a single column can contain mixed numeric and string sentinel values.
-        reader = pd.read_csv(
-            file_path,
+        with pd.read_csv(
+            csv_path,
             chunksize=chunk_size,
-            low_memory=False,
+            low_memory=False,           # Prevents mixed-type column inference
+            on_bad_lines="warn",        # Emit a warning; skip malformed rows
             encoding="utf-8",
-            on_bad_lines="warn",    # Log malformed rows; do NOT abort the stream.
-        )
+            encoding_errors="replace",  # Replace un-decodable bytes with U+FFFD
+        ) as reader:
 
-        for chunk in reader:
-            # ── Row-limit guard: trim the current chunk if needed ──────────────
-            # We check before incrementing rows_consumed so the slice is based
-            # on how many rows we have processed so far.
-            if row_limit is not None:
-                remaining = row_limit - rows_consumed
-                if remaining <= 0:
-                    break
-                if len(chunk) > remaining:
-                    # .copy() prevents a SettingWithCopyWarning when _process_chunk
-                    # modifies the trimmed slice in-place (column dtype coercions).
+            for chunk in reader:
+
+                # ── MANDATORY: strip whitespace from every column header ──────
+                # CICFlowMeter and other tools frequently emit headers with
+                # leading spaces (e.g. " Src Port") that break column lookups.
+                chunk.columns = chunk.columns.str.strip()
+
+                # ── Enforce optional per-file row ceiling ────────────────────
+                if row_limit is not None:
+                    remaining = row_limit - rows_yielded
+                    if remaining <= 0:
+                        logger.debug(
+                            "Row limit of %d reached for %s — stopping early.",
+                            row_limit, csv_path.name,
+                        )
+                        return
+                    # Slice and copy to avoid SettingWithCopyWarning downstream
                     chunk = chunk.iloc[:remaining].copy()
 
-            chunk_len    = len(chunk)
-            chunk_count += 1
+                rows_yielded += len(chunk)
+                yield chunk
 
-            validated, n_failed = _process_chunk(chunk, dataset_type)
-            all_logs.extend(validated)
+                if row_limit is not None and rows_yielded >= row_limit:
+                    return
 
-            rows_consumed  += chunk_len
-            rows_validated += len(validated)
-            rows_failed    += n_failed
-
-            log.debug(
-                "Chunk %4d | rows=%5d | ok=%5d | fail=%3d | cumulative_ok=%d",
-                chunk_count, chunk_len, len(validated), n_failed, rows_validated,
-            )
-
-            # Secondary guard: exit after the chunk that crosses the row_limit.
-            if row_limit is not None and rows_consumed >= row_limit:
-                break
-
+    except FileNotFoundError:
+        logger.error("CSV not found           : %s", csv_path)
     except pd.errors.EmptyDataError:
-        log.error("CSV file is empty or has no parseable columns: %s", file_path)
+        logger.warning("Empty CSV — skipping    : %s", csv_path)
     except UnicodeDecodeError as exc:
-        log.error(
-            "Encoding error reading %s — try encoding='latin-1' if the file "
-            "uses Windows-1252: %s", file_path, exc
-        )
-    except Exception as exc:
-        log.error(
-            "Unexpected failure in stream_and_process | file=%s | %s: %s",
-            file_path, type(exc).__name__, exc, exc_info=True,
+        logger.error("Encoding error in %s    : %s", csv_path, exc)
+    except PermissionError:
+        logger.error("Permission denied       : %s", csv_path)
+    except Exception as exc:  # noqa: BLE001 — log and continue; don't crash pipeline
+        logger.error(
+            "Unexpected error reading %s : %s", csv_path, exc, exc_info=True
         )
 
-    log.warning(
-        "STREAM END   | file=%-55s | chunks=%d | consumed=%d | "
-        "validated=%d | failed=%d",
-        file_path.name, chunk_count, rows_consumed, rows_validated, rows_failed,
+
+# =============================================================================
+# SECTION 6 — Dataset-Level Ingestion Pipelines  (Directory Traversal)
+# =============================================================================
+# Each pipeline function:
+#   1. Validates that the directory exists and contains *.csv files.
+#   2. Sorts files deterministically (alphabetical / chronological by name).
+#   3. Applies an optional file ceiling (development mode).
+#   4. Streams each file's chunks through the appropriate mapper.
+#   5. Attempts Pydantic validation on each translated row.
+#   6. Drops corrupted rows to stderr and continues — never halts the pipeline.
+# =============================================================================
+
+def _resolve_csv_files(directory: Path, file_limit: Optional[int]) -> list[Path]:
+    """
+    Safely enumerate *.csv files inside *directory* and apply an optional cap.
+
+    Returns an empty list (with a log warning) if the directory is missing or
+    contains no CSV files, rather than raising an exception.
+
+    Args:
+        directory:  Target directory path.
+        file_limit: If set, return at most this many files.
+
+    Returns:
+        Sorted list of Path objects pointing to discovered CSV files.
+    """
+    if not directory.exists():
+        logger.warning("Directory not found     : %s", directory)
+        logger.warning("  → Skipping dataset ingestion for this path.")
+        return []
+
+    if not directory.is_dir():
+        logger.error("Path is not a directory : %s", directory)
+        return []
+
+    files = sorted(directory.glob("*.csv"))
+
+    if not files:
+        logger.warning("No *.csv files found in : %s", directory)
+        return []
+
+    if file_limit is not None:
+        original_count = len(files)
+        files = files[:file_limit]
+        logger.info(
+            "File cap applied        : %d of %d CSV files selected from %s",
+            len(files), original_count, directory,
+        )
+
+    return files
+
+
+def ingest_ids2018_directory(
+    directory: Path,
+    file_limit: Optional[int] = None,
+    row_limit_per_file: Optional[int] = None,
+) -> Generator[UnifiedSecurityLog, None, None]:
+    """
+    Full CIC-IDS2018 ingestion pipeline.
+
+    Traversal order:
+        directory/*.csv  (sorted)
+          └─ chunks of CHUNK_SIZE rows
+               └─ _sanitize_row_dict(row)
+                    └─ parse_ids2018_row(row)
+                         └─ UnifiedSecurityLog(**mapped)   ← yield on success
+                              └─ ValidationError           ← log to stderr, skip
+
+    Args:
+        directory:          Path to the CIC-IDS2018 dataset directory.
+        file_limit:         Process at most this many CSV files (None = all).
+        row_limit_per_file: Read at most this many rows per file (None = all).
+
+    Yields:
+        Validated UnifiedSecurityLog instances, one per well-formed row.
+    """
+    csv_files = _resolve_csv_files(directory, file_limit)
+    logger.info(
+        "IDS2018 pipeline start  : %d file(s) to process from %s",
+        len(csv_files), directory,
     )
 
-    return all_logs
+    for csv_file in csv_files:
+        logger.info("IDS2018 → %s", csv_file.name)
+        records_ok   = 0
+        records_drop = 0
+
+        for chunk in stream_csv_chunks(csv_file, row_limit=row_limit_per_file):
+            for _, series in chunk.iterrows():
+                # Step 1: Global NaN/inf/None scrub
+                raw_row = _sanitize_row_dict(series.to_dict())
+                # Step 2: Dataset-specific column mapping & unit normalisation
+                mapped  = parse_ids2018_row(raw_row)
+                # Step 3: Pydantic contract validation
+                try:
+                    yield UnifiedSecurityLog(**mapped)
+                    records_ok += 1
+                except ValidationError as exc:
+                    records_drop += 1
+                    _val_logger.warning(
+                        "IDS2018 | DROPPED row in %s — %s",
+                        csv_file.name,
+                        exc.errors(include_url=False),
+                    )
+
+        logger.info(
+            "IDS2018 ✓ %s : accepted=%d  dropped=%d",
+            csv_file.name, records_ok, records_drop,
+        )
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 5 — SYNTHETIC TEST DATA GENERATORS                                ║
-# ║  Enables immediate local verification without real dataset files.           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-def _write_ids2018_sample(path: Path, n: int = 10) -> None:
+def ingest_doh2020_directory(
+    directory: Path,
+    file_limit: Optional[int] = None,
+    row_limit_per_file: Optional[int] = None,
+) -> Generator[UnifiedSecurityLog, None, None]:
     """
-    Write a minimal CIC-IDS2018-compatible CSV at *path*.
+    Full CIC-DoHBrw-2020 ingestion pipeline.
 
-    Deliberately reproduces real-world CIC quirks for end-to-end pipeline testing:
-      • Column headers have LEADING SPACES — tests Stage-1 header stripping.
-      • Row index 2 contains "Infinity" in the bytes/s column — tests inf handling.
-      • Row index 4 has an empty Label — tests the sanitize_str fallback.
-      • Mixed protocol integers including unmapped codes — tests IDS2018_PROTO_MAP.
+    Mirrors the IDS2018 pipeline structure but routes each row through
+    parse_doh2020_row (seconds→µs conversion, port 443 defaulting, etc.).
+
+    Args:
+        directory:          Path to the CIC-DoHBrw-2020 dataset directory.
+        file_limit:         Process at most this many CSV files (None = all).
+        row_limit_per_file: Read at most this many rows per file (None = all).
+
+    Yields:
+        Validated UnifiedSecurityLog instances, one per well-formed row.
     """
-    random.seed(42)
-    labels = ["BENIGN", "DDoS", "DoS Hulk", "PortScan", "Bot", "Infilteration"]
-    protos = [6, 17, 0, 58, 41]   # TCP, UDP, Unknown (×3)
+    csv_files = _resolve_csv_files(directory, file_limit)
+    logger.info(
+        "DoH2020 pipeline start  : %d file(s) to process from %s",
+        len(csv_files), directory,
+    )
 
-    # Deliberate leading spaces on headers — this is the canonical CIC format
-    fieldnames = [
-        " Dst Port", " Protocol", " Timestamp", " Flow Duration",
-        " Flow Byts/s", " Flow Pkts/s", " Label",
-    ]
+    for csv_file in csv_files:
+        logger.info("DoH2020 → %s", csv_file.name)
+        records_ok   = 0
+        records_drop = 0
 
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for i in range(n):
-            # Row 2: inject "Infinity" to validate Stage-2 bulk sanitization
-            bps_val = "Infinity" if i == 2 else round(random.uniform(100, 5_000_000), 4)
-            # Row 4: empty label to test sanitize_str default fallback
-            lbl_val = "" if i == 4 else random.choice(labels)
-            writer.writerow({
-                " Dst Port":      random.randint(1, 65535),
-                " Protocol":      random.choice(protos),
-                " Timestamp":     (
-                    f"{random.randint(14, 22):02d}/02/2018 "
-                    f"{random.randint(0, 23):02d}:"
-                    f"{random.randint(0, 59):02d}:"
-                    f"{random.randint(0, 59):02d}"
-                ),
-                " Flow Duration": random.randint(500, 50_000_000),   # microseconds
-                " Flow Byts/s":   bps_val,
-                " Flow Pkts/s":   round(random.uniform(1, 50_000), 4),
-                " Label":         lbl_val,
-            })
+        for chunk in stream_csv_chunks(csv_file, row_limit=row_limit_per_file):
+            for _, series in chunk.iterrows():
+                raw_row = _sanitize_row_dict(series.to_dict())
+                mapped  = parse_doh2020_row(raw_row)
+                try:
+                    yield UnifiedSecurityLog(**mapped)
+                    records_ok += 1
+                except ValidationError as exc:
+                    records_drop += 1
+                    _val_logger.warning(
+                        "DoH2020 | DROPPED row in %s — %s",
+                        csv_file.name,
+                        exc.errors(include_url=False),
+                    )
 
-    log.warning("IDS2018 synthetic sample written: %s (%d rows)", path, n)
+        logger.info(
+            "DoH2020 ✓ %s : accepted=%d  dropped=%d",
+            csv_file.name, records_ok, records_drop,
+        )
 
 
-def _write_doh2020_sample(path: Path, n: int = 10) -> None:
-    """
-    Write a minimal CIC-DoHBrw-2020-compatible CSV at *path*.
-
-    Deliberately reproduces real-world DoH2020 quirks:
-      • DestinationPort = 0 on row 3 — tests the dst_port=443 enforcement.
-      • Duration in fractional seconds — tests μs conversion correctness.
-      • Real-looking Cloudflare/Google DoH resolver IPs as destinations.
-    """
-    random.seed(99)
-    labels    = ["Benign", "Malicious", "NonDoH"]
-    resolvers = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"]
-    base_ts   = datetime(2020, 6, 15, 8, 0, 0)
-
-    fieldnames = [
-        "TimeStamp", "SourceIP", "DestinationIP",
-        "SourcePort", "DestinationPort", "Duration",
-        "FlowBytesSent", "FlowSentRate",
-        "FlowBytesReceived", "FlowReceivedRate",
-        "PacketsSent", "PacketsReceived",
-        "PacketSentRate", "PacketReceivedRate",
-        "Label",
-    ]
-
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for i in range(n):
-            dur    = round(random.uniform(0.001, 4.999), 6)   # seconds
-            b_sent = random.randint(200,  60_000)
-            b_recv = random.randint(500, 200_000)
-            p_sent = random.randint(2, 120)
-            p_recv = random.randint(3, 400)
-            writer.writerow({
-                "TimeStamp":          (base_ts + timedelta(seconds=i * 0.75)).isoformat(),
-                "SourceIP":           f"192.168.{random.randint(0, 255)}.{random.randint(1, 254)}",
-                "DestinationIP":      random.choice(resolvers),
-                "SourcePort":         random.randint(1024, 65535),
-                # Row 3: 0 destination port to trigger the enforcement guard
-                "DestinationPort":    0 if i == 3 else 443,
-                "Duration":           dur,
-                "FlowBytesSent":      b_sent,
-                "FlowSentRate":       round(b_sent / dur, 4),
-                "FlowBytesReceived":  b_recv,
-                "FlowReceivedRate":   round(b_recv / dur, 4),
-                "PacketsSent":        p_sent,
-                "PacketsReceived":    p_recv,
-                "PacketSentRate":     round(p_sent / dur, 4),
-                "PacketReceivedRate": round(p_recv / dur, 4),
-                "Label":              random.choice(labels),
-            })
-
-    log.warning("DoH2020 synthetic sample written: %s (%d rows)", path, n)
-
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  SECTION 6 — LOCAL VERIFICATION MAIN LOOP                                  ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+# =============================================================================
+# SECTION 7 — Test Execution Main Loop
+# =============================================================================
+# In TEST MODE (the defaults below) the script:
+#   • Processes only the first MAX_FILES_PER_DATASET CSV files per dataset
+#   • Reads only the first MAX_ROWS_PER_FILE data rows from each file
+#   • Prints every validated UnifiedSecurityLog as indented JSON to stdout
+#
+# To run a full production ingest, set both limits to None.
+# =============================================================================
 
 if __name__ == "__main__":
-    import textwrap
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ▶  CONFIGURE YOUR DATASET PATHS HERE
+    # CONFIGURE: Replace these paths with your actual dataset directories.
+    # Both may reside on the same storage volume or separate mounts.
     # ─────────────────────────────────────────────────────────────────────────
-    #
-    # Point these variables at your actual CIC dataset CSV files:
-    #
-    #   IDS2018 download:
-    #     https://www.unb.ca/cic/datasets/ids-2018.html
-    #     Example file: Wednesday-14-02-2018_TrafficForML_CICFlowMeter.csv
-    #
-    #   DoH2020 download:
-    #     https://www.unb.ca/cic/datasets/dohbrw-2020.html
-    #     Example file: l1-benign-doh.csv
-    #
-    # If either path does not exist, the script AUTO-GENERATES a synthetic
-    # sample CSV that faithfully reproduces the dataset's column structure and
-    # known quirks — so you can verify the full pipeline immediately.
-    #
-    IDS2018_CSV = Path("/Volumes/Expansion/CyberML_Dataset/CSVs/Total_CSVs")
-    DOH2020_CSV = Path("/Volumes/Expansion/CyberML_Dataset/archive")
+    DIR_IDS2018: Path = Path("/Volumes/Expansion/CyberML_Dataset/archive")
+    DIR_DOH2020: Path = Path("/Volumes/Expansion/CyberML_Dataset/CSVs/Total_CSVs")
+
     # ─────────────────────────────────────────────────────────────────────────
+    # TEST-MODE LIMITS
+    # MAX_FILES_PER_DATASET = 2    → read the first 2 *.csv files per dataset
+    # MAX_ROWS_PER_FILE     = 5    → read the first 5 data rows per file
+    # Set either to None for a full production ingest (no limits).
+    # ─────────────────────────────────────────────────────────────────────────
+    MAX_FILES_PER_DATASET: int = 2
+    MAX_ROWS_PER_FILE:     int = 5
 
-    VERIFY_N = 5   # Exact number of rows to read and validate per dataset.
+    _SEP  = "═" * 72
+    _THIN = "─" * 72
 
-    # ── Terminal colour helpers ───────────────────────────────────────────────
-    # Degrade gracefully on terminals that do not support ANSI escape codes.
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-    RED    = "\033[91m"
-    SEP    = "═" * 72
-    SUBSEP = "─" * 72
+    print(_SEP)
+    print("  PHASE 1 — DATA CONTRACTS & INGESTION ENGINE")
+    print("  Autonomous Multi-Agent Threat Intelligence System")
+    print(_THIN)
+    print(f"  Mode          : TEST (limits active)")
+    print(f"  File cap      : {MAX_FILES_PER_DATASET} CSV file(s) per dataset")
+    print(f"  Row cap       : {MAX_ROWS_PER_FILE} row(s) per file")
+    print(f"  IDS2018 dir   : {DIR_IDS2018.resolve()}")
+    print(f"  DoH2020  dir  : {DIR_DOH2020.resolve()}")
+    print(_SEP)
 
-    # ── Banner ────────────────────────────────────────────────────────────────
-    print(f"\n{BOLD}{BLUE}{SEP}{RESET}")
-    print(
-        f"{BOLD}{BLUE}  UNIFIED SECURITY LOG INGESTION PIPELINE  "
-        f"—  PHASE 1 VERIFICATION{RESET}"
-    )
-    print(f"{BOLD}{BLUE}{SEP}{RESET}")
-    print(textwrap.dedent(f"""
-    {BOLD}Runtime Configuration{RESET}
-      IDS2018 path   : {IDS2018_CSV}
-      DoH2020 path   : {DOH2020_CSV}
-      Rows/dataset   : {VERIFY_N}  (one micro-chunk per dataset)
-      Chunk size     : {VERIFY_N}  (verification mode — chunk == row limit)
-      pandas version : {pd.__version__}
-      pydantic ver.  : {pydantic.VERSION}
-    """))
+    # ── CIC-IDS2018 ──────────────────────────────────────────────────────────
+    print("\n▶  CIC-IDS2018 — Validated UnifiedSecurityLog Records")
+    print(_THIN)
 
-    # ── Auto-generate synthetic samples when real files are not present ───────
-    IDS2018_CSV.parent.mkdir(parents=True, exist_ok=True)
-    DOH2020_CSV.parent.mkdir(parents=True, exist_ok=True)
+    ids_total = 0
+    for log_record in ingest_ids2018_directory(
+        DIR_IDS2018,
+        file_limit=MAX_FILES_PER_DATASET,
+        row_limit_per_file=MAX_ROWS_PER_FILE,
+    ):
+        print(log_record.model_dump_json(indent=2))
+        print(_THIN)
+        ids_total += 1
 
-    if not IDS2018_CSV.exists():
-        print(
-            f"  {YELLOW}[AUTO-GEN]{RESET} IDS2018 file not found — "
-            f"generating synthetic sample with embedded quirks…"
-        )
-        # Generate slightly more rows than VERIFY_N so the chunk-trim path is exercised.
-        _write_ids2018_sample(IDS2018_CSV, n=VERIFY_N + 5)
+    print(f"\n  ✔  IDS2018 records emitted : {ids_total}")
 
-    if not DOH2020_CSV.exists():
-        print(
-            f"  {YELLOW}[AUTO-GEN]{RESET} DoH2020 file not found — "
-            f"generating synthetic sample with embedded quirks…"
-        )
-        _write_doh2020_sample(DOH2020_CSV, n=VERIFY_N + 5)
+    # ── CIC-DoHBrw-2020 ──────────────────────────────────────────────────────
+    print("\n▶  CIC-DoHBrw-2020 — Validated UnifiedSecurityLog Records")
+    print(_THIN)
 
-    # ── Process each dataset and print validated records ──────────────────────
-    results: dict[str, list[UnifiedSecurityLog]] = {}
+    doh_total = 0
+    for log_record in ingest_doh2020_directory(
+        DIR_DOH2020,
+        file_limit=MAX_FILES_PER_DATASET,
+        row_limit_per_file=MAX_ROWS_PER_FILE,
+    ):
+        print(log_record.model_dump_json(indent=2))
+        print(_THIN)
+        doh_total += 1
 
-    for ds_type, csv_path in [("IDS2018", IDS2018_CSV), ("DoH2020", DOH2020_CSV)]:
-        print(f"\n{SUBSEP}")
-        print(
-            f"{BOLD}{CYAN}  [{ds_type}]{RESET}  "
-            f"Streaming {VERIFY_N} rows from: {BOLD}{csv_path}{RESET}"
-        )
-        print(f"{SUBSEP}")
+    print(f"\n  ✔  DoH2020 records emitted : {doh_total}")
 
-        logs = stream_and_process(
-            file_path    = csv_path,
-            dataset_type = ds_type,          # type: ignore[arg-type]
-            chunk_size   = VERIFY_N,         # Micro-chunk exactly matches our limit
-            row_limit    = VERIFY_N,
-        )
-        results[ds_type] = logs
-
-        if not logs:
-            print(
-                f"\n  {RED}⚠  No valid records produced for [{ds_type}].{RESET}\n"
-                f"  Check:\n"
-                f"    • The CSV file exists at the configured path.\n"
-                f"    • Column names match the expected CIC dataset format.\n"
-                f"    • Row-level ValidationErrors are printed to stderr above.\n"
-            )
-            continue
-
-        # Print each validated record as pretty-printed JSON via Pydantic's
-        # built-in model_dump_json() — guarantees valid JSON output every time.
-        for i, entry in enumerate(logs, start=1):
-            label_tag = f"[{entry.ground_truth_label}]"
-            print(
-                f"\n  {BOLD}Record #{i}{RESET}  "
-                f"{GREEN}{label_tag}{RESET}  "
-                f"protocol={CYAN}{entry.protocol}{RESET}"
-            )
-            json_str = entry.model_dump_json(indent=2)
-            # Indent the JSON block for clean console alignment with the heading above.
-            indented = "\n".join(f"    {line}" for line in json_str.splitlines())
-            print(indented)
-
-    # ── Verification Summary ──────────────────────────────────────────────────
-    print(f"\n{BOLD}{BLUE}{SEP}{RESET}")
-    print(f"{BOLD}{BLUE}  VERIFICATION SUMMARY{RESET}")
-    print(f"{BOLD}{BLUE}{SEP}{RESET}")
-
-    all_passed = True
-    for ds_type, logs in results.items():
-        ok   = len(logs)
-        icon = f"{GREEN}✓" if ok == VERIFY_N else (f"{YELLOW}~" if ok > 0 else f"{RED}✗")
-        note = ""
-        if ok < VERIFY_N:
-            note = f"  ← {VERIFY_N - ok} row(s) dropped (see stderr)"
-            all_passed = False
-        print(f"  {icon}  {ds_type:<12}{RESET}  {ok}/{VERIFY_N} records validated{note}")
-
-    final_msg = (
-        f"{GREEN}Pipeline OK — all {VERIFY_N * 2} records passed validation.{RESET}"
-        if all_passed
-        else f"{YELLOW}Some records failed — inspect stderr output above for details.{RESET}"
-    )
-    print(f"\n  {BOLD}{final_msg}{RESET}")
-    print(f"{BOLD}{BLUE}{SEP}{RESET}\n")
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print()
+    print(_SEP)
+    print(f"  PIPELINE COMPLETE")
+    print(f"  Total validated records  :  {ids_total + doh_total}")
+    print(f"    IDS2018                :  {ids_total}")
+    print(f"    DoH2020                :  {doh_total}")
+    print(_SEP)
