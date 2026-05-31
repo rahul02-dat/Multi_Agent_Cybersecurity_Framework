@@ -761,15 +761,15 @@ if __name__ == "__main__":
     # ─────────────────────────────────────────────────────────────────────────
     # Dataset source directories (unchanged from test config)
     # ─────────────────────────────────────────────────────────────────────────
-    DIR_IDS2018: Path = Path("/Volumes/Expansion/CyberML_Dataset/archive")
-    DIR_DOH2020: Path = Path("/Volumes/Expansion/CyberML_Dataset/CSVs/Total_CSVs")
+    DIR_IDS2018: Path = Path("Define Path to IDS2018 CSVs here")
+    DIR_DOH2020: Path = Path("Define Path to DoH2020 CSVs here")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Output file — all records from both datasets land here sequentially.
     # Agents read it with:  for line in open(path): record = json.loads(line)
     # ─────────────────────────────────────────────────────────────────────────
     OUTPUT_JSONL: Path = Path(
-        "/Users/rahulmac/Documents/Projects/projects/cyberML/unified_network_logs.jsonl"
+        "Define Path to output JSONL file here"
     )
 
     # ─────────────────────────────────────────────────────────────────────────
