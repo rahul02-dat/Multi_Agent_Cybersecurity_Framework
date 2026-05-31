@@ -61,7 +61,7 @@ class C:
 
 LOG_FILE       = "/Users/rahulmac/Documents/Projects/projects/cyberML/unified_network_logs.jsonl"
 OLLAMA_URL     = "http://localhost:11434/api/generate"
-OLLAMA_MODEL   = "qwen3-coder:latest"
+OLLAMA_MODEL   = "."   # choose your model (e.g. qwen3-coder:latest, deepseek-r1:8b, etc.)
 OLLAMA_TIMEOUT = 120           # seconds — raise on slow hardware / large models
 
 PROGRESS_EVERY = 1_000         # print a heartbeat every N records
