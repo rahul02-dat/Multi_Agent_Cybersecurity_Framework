@@ -2,11 +2,34 @@
 """
 agent_orchestrator.py
 =====================
-Phase 2: Autonomous Multi-Agent Threat Intelligence System
+Phase 3: Autonomous Multi-Agent Threat Intelligence System
 ----------------------------------------------------------
-Architecture
-  Agent 1  ->  WatchdogAgent       : Fast Python heuristics for stream triage
-  Agent 2  ->  ThreatAnalystAgent  : Local Ollama LLM for deep-dive analysis
+Async Producer–Consumer Orchestration Layer
+  producer_task   : Reads LOG_FILE line-by-line, triages each record with
+                    WatchdogAgent (O(1)), and pushes flagged items onto a
+                    bounded asyncio.Queue.
+  worker_task     : Pool of NUM_WORKERS coroutines.  Each pulls from the
+                    queue and offloads ThreatAnalystAgent.analyze() — a
+                    blocking requests.post() call — to a ThreadPoolExecutor
+                    via asyncio.to_thread(), keeping the event loop free for
+                    sibling workers during every LLM round-trip.
+  async_main      : Wires the queue, worker pool, and producer together;
+                    drains the queue with queue.join(); tears down workers
+                    gracefully on completion or interruption.
+  main            : Synchronous entry point.  Owns the try/except/finally
+                    that guarantees _print_summary() is always printed,
+                    regardless of how the async pipeline terminates.
+
+Phase 2 agents (WatchdogAgent, ThreatAnalystAgent) and all UI/banner helpers
+are preserved verbatim per the Phase 3 upgrade constraints.
+
+Why agents are instantiated in main(), not async_main()
+-------------------------------------------------------
+asyncio.run() can be interrupted by KeyboardInterrupt in a way that bypasses
+the running coroutine's exception handlers on Python < 3.11.  Keeping
+watchdog, analyst, and counters in the synchronous scope of main() means the
+finally block can always read their final state and print the summary,
+regardless of where the async code was cut short.
 
 Data Contract  (each JSONL line must carry these keys)
   source_dataset, timestamp, protocol, flow_duration (microseconds),
@@ -17,12 +40,13 @@ Usage
   python3 agent_orchestrator.py
 
 Requirements
-  Python  3.9+
+  Python  3.9+  (3.11+ recommended for reliable Ctrl-C async delivery)
   pip     install requests          (only non-stdlib dependency)
   Ollama  running locally:          ollama serve
   Model   pulled:                   ollama pull qwen3-coder:latest
 """
 
+import asyncio
 import json
 import os
 import re
@@ -65,6 +89,15 @@ OLLAMA_MODEL   = "."   # choose your model (e.g. qwen3-coder:latest, deepseek-r1
 OLLAMA_TIMEOUT = 120           # seconds — raise on slow hardware / large models
 
 PROGRESS_EVERY = 1_000         # print a heartbeat every N records
+
+# ── Phase 3: Async orchestration constants ────────────────────────────────────
+NUM_WORKERS:   int = 3       # Consumer worker coroutines in the pool
+QUEUE_MAXSIZE: int = 1_000   # asyncio.Queue capacity — acts as backpressure valve:
+                              # once full, queue.put() suspends the producer until
+                              # a worker drains a slot, capping in-flight memory.
+YIELD_EVERY:   int = 500     # Yield event-loop control every N raw file lines in
+                              # producer_task so workers are scheduled concurrently
+                              # with file reading (see producer_task docstring).
 
 # ── Watchdog thresholds ──────────────────────────────────────────────────────
 PPS_THRESHOLD   = 1_000                 # packets/second  (Rule 1)
@@ -446,24 +479,343 @@ def _print_summary(
 
 
 # =============================================================================
+#  Phase 3 — Async Producer-Consumer Infrastructure
+# =============================================================================
+
+class _Counters:
+    """
+    Lightweight mutable counter namespace shared between producer_task and
+    main()'s finally block.
+
+    Thread-safety rationale
+    -----------------------
+    All mutations occur exclusively on the asyncio event-loop thread:
+
+      • producer_task is a coroutine — its body runs on the event-loop thread
+        between await checkpoints.
+      • worker_task updates (if any were added here) would also happen after
+        `await asyncio.to_thread()` returns, which resumes on the event-loop
+        thread, not the worker thread.
+
+    Because no mutation crosses thread boundaries, no locking is required.
+    """
+    __slots__ = ("total_scanned", "total_flagged", "parse_errors")
+
+    def __init__(self) -> None:
+        self.total_scanned: int = 0
+        self.total_flagged: int = 0
+        self.parse_errors:  int = 0
+
+
+async def producer_task(
+    queue:    asyncio.Queue,
+    watchdog: WatchdogAgent,
+    counters: _Counters,
+) -> None:
+    """
+    Phase 3 Producer — streams LOG_FILE line-by-line, triages each record
+    with WatchdogAgent, and enqueues (record, rule_desc, line_no) tuples for
+    the consumer worker pool.
+
+    Cooperative multitasking strategy
+    ----------------------------------
+    File I/O is intentionally synchronous (plain open()) per the Phase 3
+    zero-new-dependency constraint.  Without mitigation, a tight file-read
+    loop would monopolise the event loop, starving worker coroutines of
+    scheduling time and negating the concurrency benefit.
+
+    Two mechanisms restore fairness:
+
+      1. ``await asyncio.sleep(0)`` every YIELD_EVERY (500) raw lines.
+         This is a cooperative yield: it relinquishes the event loop to the
+         scheduler without any real sleep, allowing waiting worker coroutines
+         (blocked on queue.get()) to be dispatched and run their next steps.
+         Cost: one scheduling round-trip per 500 lines — negligible overhead.
+
+      2. ``await queue.put(item)`` auto-suspends when the queue is full
+         (at QUEUE_MAXSIZE), providing natural backpressure: the fast
+         producer blocks until a worker drains a slot, capping peak memory
+         at QUEUE_MAXSIZE × (record size) regardless of dataset volume.
+
+    Args
+    ----
+    queue    : Bounded asyncio.Queue connecting producer → workers.
+    watchdog : Initialised WatchdogAgent; evaluate each record in O(1).
+    counters : Shared _Counters namespace updated on the event-loop thread.
+
+    Raises
+    ------
+    OSError  Propagated to async_main on file I/O failure so the finally
+             block can cancel workers before the exception reaches main().
+    """
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as fh:
+            for line_no, raw in enumerate(fh, start=1):
+
+                # ── Cooperative yield ─────────────────────────────────────
+                # asyncio.sleep(0) hands control back to the event-loop
+                # scheduler so waiting workers (queue.get()) get a turn.
+                # Without this, the tight for-loop would block all other
+                # coroutines until EOF — defeating the async architecture.
+                if line_no % YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
+
+                raw = raw.strip()
+                if not raw:
+                    continue             # silently skip blank / empty lines
+
+                # ── Step 1: Parse JSON ────────────────────────────────────
+                try:
+                    record: dict = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    counters.parse_errors += 1
+                    _warn(f"Line {line_no}: JSON decode error — {exc}")
+                    continue             # skip malformed record, keep going
+
+                counters.total_scanned += 1
+
+                # ── Step 2: Agent 1 — WatchdogAgent triage ───────────────
+                # Pure Python heuristics; O(1) per record; no I/O.
+                # Returns (bool, rule_desc_string).
+                flagged, rule_desc = watchdog.analyze(record)
+
+                # ── Step 3: Enqueue flagged records for LLM analysis ─────
+                # await blocks here if the queue is at QUEUE_MAXSIZE,
+                # applying backpressure and preventing unbounded memory use.
+                if flagged:
+                    counters.total_flagged += 1
+                    await queue.put((record, rule_desc, line_no))
+
+                # ── Progress heartbeat ────────────────────────────────────
+                if counters.total_scanned % PROGRESS_EVERY == 0:
+                    rate = counters.total_flagged / counters.total_scanned * 100
+                    print(
+                        f"{C.D}  [~] Scanned {counters.total_scanned:>10,}  |  "
+                        f"Flagged {counters.total_flagged:>7,}  |  "
+                        f"Rate {rate:.3f}%{C.R}",
+                        flush=True,
+                    )
+
+    except OSError as exc:
+        # Propagate to async_main so its finally block cancels workers first.
+        print(f"{C.RED}[FATAL] File I/O error in producer: {exc}{C.R}")
+        raise
+
+
+async def worker_task(
+    queue:   asyncio.Queue,
+    analyst: ThreatAnalystAgent,
+) -> None:
+    """
+    Phase 3 Consumer Worker — drains the shared queue and runs deep LLM-backed
+    threat analysis on every escalated record.
+
+    Why asyncio.to_thread()?
+    ------------------------
+    ThreatAnalystAgent.analyze() calls requests.post() under the hood — a
+    synchronous, blocking HTTP operation that can stall for up to OLLAMA_TIMEOUT
+    seconds (default 120 s).  Awaiting it directly on the event loop would
+    freeze all concurrency for that duration: the producer couldn't enqueue,
+    sibling workers couldn't run, and the queue would pile up unbounded.
+
+    asyncio.to_thread() dispatches the call to Python's default
+    ThreadPoolExecutor (capacity: min(32, os.cpu_count() + 4) threads).
+    The event loop remains fully live while the HTTP round-trip executes in
+    a background thread; the await resumes only after the thread returns,
+    posting the result back to the event-loop thread safely.
+
+    CancelledError lifecycle
+    ------------------------
+    Workers run in an infinite while-loop until explicitly cancelled by
+    async_main after queue.join() completes.
+
+      CancelledError at ``await queue.get()``
+          Worker was idle (nothing in queue) when cancelled.  No item was
+          dequeued, so task_done() must NOT be called.  ``return`` exits cleanly.
+
+      CancelledError at ``await asyncio.to_thread(...)``
+          An item WAS dequeued above, so task_done() MUST be called.
+          In Python ≥ 3.8, asyncio.CancelledError inherits from BaseException
+          (not Exception), so it bypasses the ``except Exception`` clause.
+          The ``finally`` block still runs, calling task_done() before the
+          CancelledError propagates — this is the correct behaviour.
+
+    Args
+    ----
+    queue   : Shared asyncio.Queue (same instance as the producer uses).
+    analyst : Shared ThreatAnalystAgent; analyze() is called in a thread.
+              reports_generated is incremented inside the thread — a benign
+              race under the GIL with NUM_WORKERS=3; acceptable for a counter.
+    """
+    while True:
+
+        # ── Await next work item ─────────────────────────────────────────
+        # CancelledError here means the worker was shut down while idle —
+        # no item was dequeued, so task_done() must not be called.
+        try:
+            record, rule_desc, line_no = await queue.get()
+        except asyncio.CancelledError:
+            return   # clean exit; event loop will mark this task done
+
+        # ── Process the dequeued item ────────────────────────────────────
+        try:
+            # Offload the blocking HTTP call to the thread pool.
+            # The event loop is free to schedule other workers or the
+            # producer while this thread waits for the Ollama response.
+            analysis = await asyncio.to_thread(
+                analyst.analyze, record, rule_desc
+            )
+
+            # print_report() is pure stdout I/O.  It is safe to call here
+            # on the event-loop thread once the awaited thread has returned.
+            analyst.print_report(record, rule_desc, analysis, line_no)
+
+        except Exception as exc:
+            # Belt-and-suspenders: ThreatAnalystAgent.analyze() already
+            # handles requests.Timeout, ConnectionError, HTTPError, and
+            # JSONDecodeError internally, returning formatted error strings.
+            # This clause catches any unforeseen exception so a single bad
+            # record never kills the worker.
+            #
+            # NOTE: asyncio.CancelledError (BaseException, not Exception)
+            # is intentionally NOT caught here.  It propagates to the
+            # finally block below, which calls task_done() before allowing
+            # the cancellation to exit the while-loop naturally.
+            _warn(
+                f"Worker: unexpected error on stream line {line_no} — "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        finally:
+            # Always decrement the queue's internal join-counter, regardless
+            # of whether processing succeeded, raised, or was cancelled.
+            # This unblocks queue.join() in async_main once all items are done.
+            queue.task_done()
+
+
+async def async_main(
+    watchdog: WatchdogAgent,
+    analyst:  ThreatAnalystAgent,
+    counters: _Counters,
+) -> None:
+    """
+    Phase 3 Async Orchestrator — wires the Producer-Consumer pipeline.
+
+    Receives pre-initialised agents and the shared counter namespace from
+    main() so that main()'s finally block can unconditionally call
+    _print_summary() regardless of how or where the pipeline terminates.
+    (See module docstring for the Python < 3.11 rationale.)
+
+    Shutdown sequence
+    -----------------
+    1. producer_task() reads LOG_FILE line-by-line to EOF, triaging every
+       record and enqueuing flagged ones.  It naturally terminates on EOF
+       (or raises OSError on I/O failure).
+
+    2. ``await queue.join()`` blocks until every item placed by the producer
+       has been fully processed by a worker — i.e. task_done() has been
+       called NUM_FLAGGED times.  This guarantees no analysis is silently
+       dropped before the summary is printed.
+
+    3. Worker tasks are cancelled.  At this point all workers are blocked on
+       ``await queue.get()`` (queue is empty post-join).  cancel() injects
+       CancelledError into that await, causing each worker's ``return`` to
+       execute cleanly.  ``asyncio.gather(return_exceptions=True)`` awaits
+       their teardown so worker finally blocks run before async_main returns.
+
+    CancelledError (Python 3.11+ Ctrl-C)
+    -------------------------------------
+    In Python 3.11+, asyncio.run() installs a SIGINT handler that cancels
+    the main task before re-raising KeyboardInterrupt.  CancelledError is
+    suppressed here (``pass``) so that async_main returns normally, giving
+    the finally block time to cancel workers and drain their teardown.
+    main()'s ``except KeyboardInterrupt`` then prints the user message and
+    falls through to the finally block for the summary.
+
+    Args
+    ----
+    watchdog : Initialised WatchdogAgent, passed through to producer_task.
+    analyst  : Initialised ThreatAnalystAgent, shared across all workers.
+    counters : Shared _Counters namespace updated by producer_task.
+    """
+    # Bounded queue: producer suspends on put() once QUEUE_MAXSIZE slots are
+    # occupied, applying backpressure so memory usage stays O(QUEUE_MAXSIZE).
+    queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+
+    # Initialised before the try block so the finally clause can always
+    # iterate workers even if an exception fires during task creation.
+    workers: list[asyncio.Task] = []
+
+    try:
+        # ── Spin up the consumer worker pool ──────────────────────────────
+        # Tasks are scheduled immediately; they block on queue.get() until
+        # the producer enqueues the first flagged record.
+        workers = [
+            asyncio.create_task(
+                worker_task(queue, analyst),
+                name=f"threat-analyst-worker-{i}",
+            )
+            for i in range(NUM_WORKERS)
+        ]
+
+        # ── Run the producer to EOF ────────────────────────────────────────
+        # producer_task yields every YIELD_EVERY lines so workers receive
+        # CPU time concurrently with file reading.
+        await producer_task(queue, watchdog, counters)
+
+        # ── Drain the queue ────────────────────────────────────────────────
+        # Blocks until every item enqueued by the producer has had
+        # task_done() called by a worker — i.e. fully analysed and reported.
+        await queue.join()
+
+    except asyncio.CancelledError:
+        # Swallow CancelledError so async_main can return normally and let
+        # its finally block cancel workers cleanly.  main()'s except clause
+        # prints the "Interrupted" message.
+        pass
+
+    finally:
+        # ── Graceful worker teardown ───────────────────────────────────────
+        # Workers are sitting on ``await queue.get()`` (queue drained, or
+        # interrupted mid-flight).  cancel() injects CancelledError into
+        # that await; each worker catches it and returns.
+        for w in workers:
+            w.cancel()
+
+        # Await all worker teardowns before returning.
+        # return_exceptions=True prevents any worker's CancelledError from
+        # propagating here and masking the real reason for shutdown.
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
+# =============================================================================
 #  Orchestrator — main()
 # =============================================================================
 
 def main() -> None:
     """
-    Entry point.
+    Synchronous entry point for the Phase 3 async orchestrator.
 
-    Opens the unified JSONL log stream, reads it line-by-line without
-    loading the entire file into memory (safe for multi-GB datasets), then
-    routes every record through the two-agent pipeline:
+    Responsibilities
+    ----------------
+    • Render the startup banner and verify the log file exists.
+    • Instantiate shared state (agents, counters, wall-clock timer) on the
+      main thread, outside the event loop, so the finally block below can
+      always access their final values regardless of async termination path.
+    • Launch the async pipeline with asyncio.run(async_main(...)).
+    • Guarantee that _print_summary() is ALWAYS called — on normal
+      completion, Ctrl-C (KeyboardInterrupt), or file I/O failure — via the
+      unconditional finally block.
 
-        raw line  ->  json.loads()
-                   ->  WatchdogAgent.analyze()
-                   ->  [if suspicious] ThreatAnalystAgent.analyze()
-                                       ThreatAnalystAgent.print_report()
-
-    Catches KeyboardInterrupt gracefully so Ctrl-C always prints a partial
-    summary rather than a raw traceback.
+    Guaranteed summary printing across Python versions
+    --------------------------------------------------
+    asyncio.run() may re-raise KeyboardInterrupt after cancelling the main
+    task (Python 3.11+) OR propagate it immediately, bypassing async_main's
+    exception handlers (Python 3.9–3.10).  By owning the agents/counters and
+    the finally block here — in synchronous scope — _print_summary() fires
+    regardless of which path asyncio takes.  asyncio.run() then becomes
+    strictly responsible for event-loop lifecycle; main() handles I/O and
+    reporting.
     """
     # ── Startup banner ────────────────────────────────────────────────────────
     print(f"\n{C.GRN}{C.B}{_build_banner()}{C.R}\n")
@@ -479,80 +831,59 @@ def main() -> None:
 
     mb = os.path.getsize(LOG_FILE) / 1_048_576
     print(f"{C.GRN}[OK] Log file verified  ({mb:,.2f} MB){C.R}")
-    print(f"{C.GRN}[OK] Agents initialised{C.R}")
+    print(
+        f"{C.GRN}[OK] Agents initialised — "
+        f"{NUM_WORKERS} consumer worker(s) | "
+        f"queue capacity {QUEUE_MAXSIZE:,}{C.R}"
+    )
     print(
         f"{C.D}     Heartbeat every {PROGRESS_EVERY:,} records — "
         f"Ctrl-C at any time for a partial summary\n{C.R}"
     )
 
-    # ── Instantiate agents ────────────────────────────────────────────────────
+    # ── Instantiate shared state on the synchronous (main) thread ─────────────
+    # Kept here — not inside async_main — so the finally block below can
+    # always reach them.  See module docstring for the full rationale.
     watchdog = WatchdogAgent()
     analyst  = ThreatAnalystAgent()
+    counters = _Counters()
+    t0       = time.perf_counter()
 
-    # ── Runtime counters ──────────────────────────────────────────────────────
-    total_scanned: int = 0
-    total_flagged: int = 0
-    parse_errors:  int = 0
-    t0 = time.perf_counter()
-
-    # ── Main stream loop ──────────────────────────────────────────────────────
+    # ── Run the async pipeline ────────────────────────────────────────────────
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as fh:
-            for line_no, raw in enumerate(fh, start=1):
-
-                raw = raw.strip()
-                if not raw:
-                    continue                  # silently skip blank / empty lines
-
-                # ── Step 1: Parse JSON ────────────────────────────────────
-                try:
-                    record: dict = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    parse_errors += 1
-                    _warn(f"Line {line_no}: JSON decode error — {exc}")
-                    continue                  # skip malformed record, keep going
-
-                total_scanned += 1
-
-                # ── Step 2: Agent 1 — Watchdog triage ────────────────────
-                #   Returns (bool, rule_string).  O(1) per record — no I/O.
-                flagged, rule_desc = watchdog.analyze(record)
-
-                # ── Step 3: Agent 2 — LLM deep-dive (escalated only) ─────
-                #   Only records that passed Watchdog are sent to the LLM,
-                #   keeping Ollama inference calls proportional to anomalies
-                #   rather than total volume.
-                if flagged:
-                    total_flagged += 1
-                    analysis = analyst.analyze(record, rule_desc)
-                    analyst.print_report(record, rule_desc, analysis, line_no)
-
-                # ── Progress heartbeat ────────────────────────────────────
-                if total_scanned % PROGRESS_EVERY == 0:
-                    rate = total_flagged / total_scanned * 100
-                    print(
-                        f"{C.D}  [~] Scanned {total_scanned:>10,}  |  "
-                        f"Flagged {total_flagged:>7,}  |  "
-                        f"Rate {rate:.3f}%{C.R}",
-                        flush=True,
-                    )
+        # asyncio.run() creates a fresh event loop, runs async_main to
+        # completion (or until cancelled / interrupted), then tears it down.
+        # All three arguments are pre-initialised objects from this scope.
+        asyncio.run(async_main(watchdog, analyst, counters))
 
     except KeyboardInterrupt:
+        # User pressed Ctrl-C.
+        # • Python 3.11+: async_main's finally already cancelled workers;
+        #   asyncio.run() re-raises KeyboardInterrupt after async cleanup.
+        # • Python 3.9–3.10: may arrive here directly, bypassing async_main.
+        # In both cases, the finally block below guarantees the summary.
         print(
             f"\n{C.YLW}{C.B}[!] Interrupted by user (Ctrl-C) — "
             f"printing partial summary below.{C.R}"
         )
+
     except OSError as exc:
+        # Propagated from producer_task (via async_main) on file I/O failure.
         print(f"{C.RED}[FATAL] File I/O error: {exc}{C.R}")
-        sys.exit(1)
+        sys.exit(1)   # SystemExit still triggers finally below
+
     finally:
-        # Always print summary — even on interrupt or error — so the analyst
-        # retains diagnostic value from a partial run.
+        # Always executed: on clean EOF, Ctrl-C, or I/O error.
+        # agents' internal counters (rule1_hits, reports_generated, etc.)
+        # reflect all work completed up to the point of termination.
         elapsed = time.perf_counter() - t0
         _print_summary(
-            total_scanned, total_flagged,
-            watchdog, analyst,
-            elapsed, parse_errors,
+            counters.total_scanned,
+            counters.total_flagged,
+            watchdog,
+            analyst,
+            elapsed,
+            counters.parse_errors,
         )
 
 
