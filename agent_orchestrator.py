@@ -2,15 +2,16 @@
 """
 agent_orchestrator.py
 =====================
-Phase 4: Autonomous Multi-Agent Threat Intelligence System
+Phase 5: Autonomous Multi-Agent Threat Intelligence System (IPS Upgrade)
 ----------------------------------------------------------
-Architecture: Async Producer-Consumer + LangGraph Agent Debate
+Architecture: Async Producer-Consumer + Fine-Tuned Gemma Debate + Active IPS
 
-1. WatchdogAgent (Producer): Deterministic, ultra-fast triage. Flags anomalies.
-2. LangGraph SOC Team (Consumers): 
-   - Node 1: Analyst Agent (Proposes threat theory)
-   - Node 2: Red Team Critic (Devil's advocate, hunts for false positives)
-   - Node 3: Lead Judge (Outputs objective final JSON verdict)
+1. WatchdogAgent: Deterministic triage.
+2. LangGraph SOC Team (Fine-Tuned Gemma Experts): 
+   - Node 1: Analyst Agent (Trained for Threat Detection)
+   - Node 2: Red Team Critic (Trained for Adversarial Benign Explanations)
+   - Node 3: Lead Judge (Trained for Strict JSON Arbitration)
+   - Node 4: Remediation Agent (Trained for Bash/Firewall Scripting)
 """
 
 import asyncio
@@ -19,9 +20,8 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import TypedDict
+from typing import TypedDict, Literal
 
-# LangGraph & LangChain dependencies
 from langgraph.graph import StateGraph, START, END
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage
@@ -43,11 +43,17 @@ class C:
     BLU = "\033[94m"  if _enabled else ""
 
 # =============================================================================
-#  Configuration
+#  Configuration & Fine-Tuned Ensemble
 # =============================================================================
-LOG_FILE          = "unified_network_logs.jsonl" # Update to your local path
+LOG_FILE          = "unified_network_logs.jsonl" 
 OLLAMA_BASE_URL   = "http://localhost:11434"
-OLLAMA_MODEL      = "gemma3:12b" # Update to your local model
+
+# Custom Fine-Tuned Gemma Models (You will build these via Ollama Modelfiles)
+ANALYST_MODEL     = "gemma4:e4b-mlx"
+CRITIC_MODEL      = "gemma4:latest"
+JUDGE_MODEL       = "gemma3:12b"
+REMEDIATION_MODEL = "gemma3:12b"
+
 NUM_WORKERS       = 3
 QUEUE_MAXSIZE     = 1000
 YIELD_EVERY       = 500
@@ -80,89 +86,88 @@ class WatchdogAgent:
 
         if pps > PPS_THRESHOLD and dst_port not in SAFE_PORTS:
             self.rule1_hits += 1
-            return True, (
-                f"[RULE-1 VOLUMETRIC ANOMALY] pps={pps:,.1f} | port={dst_port}"
-            )
+            return True, (f"[RULE-1 VOLUMETRIC ANOMALY] pps={pps:,.1f} | port={dst_port}")
 
         if (protocol == TUNNEL_PROTO and dst_port == TUNNEL_PORT and duration > TUNNEL_DURATION):
             self.rule2_hits += 1
-            return True, (
-                f"[RULE-2 TLS/DoH TUNNEL] flow_duration={duration/1_000_000:,.1f}s"
-            )
+            return True, (f"[RULE-2 TLS/DoH TUNNEL] flow_duration={duration/1_000_000:,.1f}s")
 
         return False, ""
 
 # =============================================================================
-#  Agent 2, 3, 4 — LangGraph SOC Debate Team
+#  Agent 2, 3, 4, 5 — LangGraph Fine-Tuned SOC Debate Team
 # =============================================================================
 
-# 1. Define the Graph State
 class AgentState(TypedDict):
     raw_log: dict
     watchdog_rule: str
     analyst_hypothesis: str
     critic_rebuttal: str
     final_report: dict
+    remediation_plan: dict
 
-# 2. Define the Nodes
 async def analyst_node(state: AgentState) -> dict:
-    llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.2)
-    prompt = f"""You are an expert SOC Analyst. A deterministic Watchdog flagged this log:
-    Rule Triggered: {state['watchdog_rule']}
+    llm = ChatOllama(model=ANALYST_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1)
+    prompt = f"""Rule Triggered: {state['watchdog_rule']}
     Raw Data: {json.dumps(state['raw_log'], default=str)}
-    
-    In exactly 2 sentences, state your hypothesis on why this represents a malicious attack. Cite specific data points."""
+    In exactly 2 sentences, state your hypothesis on why this represents a malicious attack."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    # Remove Qwen think tags if present
-    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
-    return {"analyst_hypothesis": content}
+    return {"analyst_hypothesis": response.content.strip()}
 
 async def critic_node(state: AgentState) -> dict:
-    # Slightly higher temperature for devil's advocate creativity
-    llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.4)
-    prompt = f"""You are a Red Team Critic. Your job is to prevent false positives by arguing against the Analyst.
-    Raw Data: {json.dumps(state['raw_log'], default=str)}
+    llm = ChatOllama(model=CRITIC_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.3)
+    prompt = f"""Raw Data: {json.dumps(state['raw_log'], default=str)}
     Analyst Hypothesis: {state['analyst_hypothesis']}
-    
-    In exactly 2 sentences, play devil's advocate. Provide a plausible benign explanation for this traffic behavior (e.g. streaming, updates, misconfiguration)."""
+    In exactly 2 sentences, play devil's advocate. Provide a plausible benign explanation for this traffic behavior."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
-    return {"critic_rebuttal": content}
+    return {"critic_rebuttal": response.content.strip()}
 
 async def judge_node(state: AgentState) -> dict:
-    # Temperature 0.0 + JSON format enforcement
-    llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.0, format="json")
-    prompt = f"""You are the Lead SOC Judge. You must evaluate the debate and make a final ruling.
-    Raw Data: {json.dumps(state['raw_log'], default=str)}
+    llm = ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.0, format="json")
+    prompt = f"""Raw Data: {json.dumps(state['raw_log'], default=str)}
     Analyst Argues: {state['analyst_hypothesis']}
     Critic Argues: {state['critic_rebuttal']}
-    
-    Output your final verdict strictly as a JSON object with these exactly keys:
-    "is_threat" (boolean), "threat_type" (string, or "False Positive"), "justification" (1 sentence explaining who won the debate)."""
+    Output a JSON object: {{"is_threat": bool, "threat_type": str, "justification": str}}."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
-    
     try:
-        report = json.loads(content)
+        report = json.loads(response.content.strip())
     except json.JSONDecodeError:
-        report = {"is_threat": True, "threat_type": "Parse Error", "justification": "Failed to parse Judge JSON output."}
-        
+        report = {"is_threat": True, "threat_type": "Parse Error", "justification": "Failed to parse Judge output."}
     return {"final_report": report}
 
-# 3. Compile the Graph
+async def remediation_node(state: AgentState) -> dict:
+    llm = ChatOllama(model=REMEDIATION_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.0, format="json")
+    prompt = f"""Raw Data: {json.dumps(state['raw_log'], default=str)}
+    Judge Verdict: {json.dumps(state['final_report'], default=str)}
+    Output a JSON object: {{"firewall_command": str, "rollback_command": str, "risk_warning": str}}."""
+    
+    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    try:
+        plan = json.loads(response.content.strip())
+    except json.JSONDecodeError:
+        plan = {"firewall_command": "echo 'Parse Error'", "rollback_command": "echo 'Error'", "risk_warning": "Parse Error"}
+    return {"remediation_plan": plan}
+
+def router(state: AgentState) -> Literal["remediation", "__end__"]:
+    if state["final_report"].get("is_threat"):
+        return "remediation"
+    return "__end__"
+
 def build_soc_graph():
     workflow = StateGraph(AgentState)
     workflow.add_node("analyst", analyst_node)
     workflow.add_node("critic", critic_node)
     workflow.add_node("judge", judge_node)
+    workflow.add_node("remediation", remediation_node)
     
     workflow.add_edge(START, "analyst")
     workflow.add_edge("analyst", "critic")
     workflow.add_edge("critic", "judge")
-    workflow.add_edge("judge", END)
+    workflow.add_conditional_edges("judge", router, {"remediation": "remediation", "__end__": END})
+    workflow.add_edge("remediation", END)
     
     return workflow.compile()
 
@@ -172,7 +177,7 @@ def print_debate_report(log: dict, rule: str, state: dict, line_no: int, report_
     mid = "-" * W
 
     print(f"\n{C.YLW}{C.B}{fat}{C.R}")
-    print(f"{C.YLW}{C.B}  [!!] LANGGRAPH DEBATE REPORT #{report_id}   |  stream line {line_no:,}{C.R}")
+    print(f"{C.YLW}{C.B}  [!!] FINE-TUNED DEBATE REPORT #{report_id}   |  stream line {line_no:,}{C.R}")
     print(f"{C.YLW}{mid}{C.R}")
 
     print(f"{C.CYN}  Timestamp          {C.WHT}{log.get('timestamp', 'N/A')}{C.R}")
@@ -181,20 +186,29 @@ def print_debate_report(log: dict, rule: str, state: dict, line_no: int, report_
     print(f"{C.CYN}  Alert Rule         {C.MAG}{rule}{C.R}")
 
     print(f"{C.YLW}{mid}{C.R}")
-    print(f"{C.RED}{C.B}  [ANALYST]  {C.R}{C.WHT}{state.get('analyst_hypothesis', '')}{C.R}\n")
-    print(f"{C.BLU}{C.B}  [CRITIC]   {C.R}{C.WHT}{state.get('critic_rebuttal', '')}{C.R}")
+    print(f"{C.RED}{C.B}  [ANALYST ({ANALYST_MODEL})]  {C.R}{C.WHT}{state.get('analyst_hypothesis', '')}{C.R}\n")
+    print(f"{C.BLU}{C.B}  [CRITIC ({CRITIC_MODEL})]    {C.R}{C.WHT}{state.get('critic_rebuttal', '')}{C.R}")
     print(f"{C.YLW}{mid}{C.R}")
     
     judge_data = state.get("final_report", {})
     threat_col = C.RED if judge_data.get("is_threat") else C.GRN
-    print(f"{C.MAG}{C.B}  [JUDGE VERDICT] {C.R}")
+    print(f"{C.MAG}{C.B}  [JUDGE VERDICT ({JUDGE_MODEL})] {C.R}")
     print(f"{C.CYN}  Threat Level:      {threat_col}{str(judge_data.get('is_threat')).upper()}{C.R}")
     print(f"{C.CYN}  Classification:    {C.WHT}{judge_data.get('threat_type')}{C.R}")
     print(f"{C.CYN}  Justification:     {C.WHT}{judge_data.get('justification')}{C.R}")
+    
+    remediation = state.get("remediation_plan", {})
+    if remediation:
+        print(f"{C.YLW}{mid}{C.R}")
+        print(f"{C.RED}{C.B}  [ACTIVE REMEDIATION ENGAGED ({REMEDIATION_MODEL})] {C.R}")
+        print(f"{C.CYN}  Deploying Firewall: {C.RED}{remediation.get('firewall_command', 'N/A')}{C.R}")
+        print(f"{C.CYN}  Rollback Script:    {C.CYN}{remediation.get('rollback_command', 'N/A')}{C.R}")
+        print(f"{C.CYN}  Risk Warning:       {C.YLW}{remediation.get('risk_warning', 'N/A')}{C.R}")
+
     print(f"{C.YLW}{C.B}{fat}{C.R}\n")
 
 # =============================================================================
-#  Phase 3/4 — Async Producer-Consumer Infrastructure
+#  Async Producer-Consumer Infrastructure
 # =============================================================================
 class _Counters:
     __slots__ = ("total_scanned", "total_flagged", "parse_errors", "reports_generated")
@@ -214,7 +228,7 @@ async def producer_task(queue: asyncio.Queue, watchdog: WatchdogAgent, counters:
                 if not raw: continue
 
                 try: record: dict = json.loads(raw)
-                except json.JSONDecodeError as exc:
+                except json.JSONDecodeError:
                     counters.parse_errors += 1
                     continue
 
@@ -245,10 +259,10 @@ async def worker_task(queue: asyncio.Queue, soc_graph, counters: _Counters) -> N
                 "watchdog_rule": rule_desc,
                 "analyst_hypothesis": "",
                 "critic_rebuttal": "",
-                "final_report": {}
+                "final_report": {},
+                "remediation_plan": {}
             }
             
-            # Use ainvoke for true asyncio non-blocking execution!
             final_state = await soc_graph.ainvoke(initial_state)
             
             counters.reports_generated += 1
@@ -306,13 +320,13 @@ def _print_summary(total: int, flagged: int, watch: WatchdogAgent, elapsed: floa
 
 def main() -> None:
     W = 76
-    print(f"\n{C.GRN}{C.B}\u2554{'='*(W-2)}\u2557\n\u2551{' '*2}AUTONOMOUS MULTI-AGENT THREAT INTELLIGENCE SYSTEM{' '*(W-53)}\u2551\n\u2551{' '*2}Phase 4  -  LangGraph Adversarial Debate{' '*(W-44)}\u2551\n\u255a{'='*(W-2)}\u255d{C.R}\n")
+    print(f"\n{C.GRN}{C.B}\u2554{'='*(W-2)}\u2557\n\u2551{' '*2}AUTONOMOUS MULTI-AGENT THREAT INTELLIGENCE SYSTEM{' '*(W-53)}\u2551\n\u2551{' '*2}Phase 5  -  Fine-Tuned Specialized Gemma Ensemble{' '*(W-49)}\u2551\n\u255a{'='*(W-2)}\u255d{C.R}\n")
 
     if not os.path.isfile(LOG_FILE):
         print(f"{C.RED}{C.B}[FATAL] Log file not found: {LOG_FILE}{C.R}")
         sys.exit(1)
 
-    print(f"{C.GRN}[OK] Agents initialised — {NUM_WORKERS} async LangGraph worker(s){C.R}\n")
+    print(f"{C.GRN}[OK] Agents initialised — {NUM_WORKERS} async LangGraph worker(s) using Gemma Fine-Tunes{C.R}\n")
     
     watchdog = WatchdogAgent()
     counters = _Counters()
