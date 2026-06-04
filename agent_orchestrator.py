@@ -2,16 +2,18 @@
 """
 agent_orchestrator.py
 =====================
-Phase 5: Autonomous Multi-Agent Threat Intelligence System (IPS Upgrade)
+Phase 6: Multi-Agent Threat Intelligence System (RAG + Active IPS)
 ----------------------------------------------------------
-Architecture: Async Producer-Consumer + Fine-Tuned Gemma Debate + Active IPS
+Architecture: Async Producer-Consumer + ChromaDB RAG + Local Gemma Swarm
 
-1. WatchdogAgent: Deterministic triage.
-2. LangGraph SOC Team (Fine-Tuned Gemma Experts): 
-   - Node 1: Analyst Agent (Trained for Threat Detection)
-   - Node 2: Red Team Critic (Trained for Adversarial Benign Explanations)
-   - Node 3: Lead Judge (Trained for Strict JSON Arbitration)
-   - Node 4: Remediation Agent (Trained for Bash/Firewall Scripting)
+1. WatchdogAgent (Producer): High-speed heuristic triage.
+2. ChromaDB (Vector Store): Local, air-gapped threat intelligence storage.
+3. LangGraph SOC Team (Consumers):
+   - Node 0: Intel Retriever (Fetches context using nomic-embed-text)
+   - Node 1: Analyst Agent (gemma4:e4b-mlx)
+   - Node 2: Red Team Critic (gemma4:latest)
+   - Node 3: Lead Judge (gemma3:12b)
+   - Node 4: Remediation Agent (gemma3:12b)
 """
 
 import asyncio
@@ -22,9 +24,11 @@ import time
 from datetime import datetime
 from typing import TypedDict, Literal
 
+# LangGraph & LangChain dependencies
 from langgraph.graph import StateGraph, START, END
-from langchain_ollama import ChatOllama
+from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.messages import HumanMessage
+from langchain_community.vectorstores import Chroma
 
 # =============================================================================
 #  ANSI Colour Palette
@@ -43,18 +47,19 @@ class C:
     BLU = "\033[94m"  if _enabled else ""
 
 # =============================================================================
-#  Configuration & Fine-Tuned Ensemble
+#  Configuration & Local Model Mapping
 # =============================================================================
 LOG_FILE          = "unified_network_logs.jsonl" 
 OLLAMA_BASE_URL   = "http://localhost:11434"
 
-# Custom Fine-Tuned Gemma Models (You will build these via Ollama Modelfiles)
+# Using your exact local models to completely bypass Hugging Face
 ANALYST_MODEL     = "gemma4:e4b-mlx"
 CRITIC_MODEL      = "gemma4:latest"
 JUDGE_MODEL       = "gemma3:12b"
 REMEDIATION_MODEL = "gemma3:12b"
+EMBEDDING_MODEL   = "nomic-embed-text"
 
-NUM_WORKERS       = 3
+NUM_WORKERS       = 2  # Set to 2 to give your 12B model breathing room in memory
 QUEUE_MAXSIZE     = 1000
 YIELD_EVERY       = 500
 PROGRESS_EVERY    = 1000
@@ -95,60 +100,112 @@ class WatchdogAgent:
         return False, ""
 
 # =============================================================================
-#  Agent 2, 3, 4, 5 — LangGraph Fine-Tuned SOC Debate Team
+#  Vector Database Setup (Local Threat Intelligence Platform)
+# =============================================================================
+def initialize_threat_intel_db():
+    print(f"{C.CYN}[*] Initializing local ChromaDB with Threat Intelligence entries...{C.R}")
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+    
+    # Concrete security indicators mapped directly to your dataset signatures
+    threat_intel_docs = [
+        "Threat ID: TIP-01 - DNS-over-HTTPS (DoH) Tunneling Indicator: Extended network sessions using TCP port 443 with low packet variance, lasting over 100 seconds with symmetric byte flow metrics, strongly indicates automated data exfiltration or active command-and-control (C2) channels.",
+        "Threat ID: TIP-02 - Volumetric DDoS Attack Vectors: Packet bursts climbing past 1,000 packets-per-second targeting specialized or atypical listener ports (e.g., 8080) are primary signatures of flood tools like DoS Hulk or LOIC attempting resource starvation.",
+        "Operational Baseline: Safe Content Delivery Networks (CDNs): Heavy data packets hitting port 443 or 80 with short, rapid lifetimes are typical behavior of distributed cloud delivery nodes or multimedia streams, not malignant data exfiltration.",
+        "Operational Baseline: Legitimate Admin SSH/Web Management: High volume connections on port 22 or 443 originating from known internal networks indicate routine administrative actions or configuration deployments."
+    ]
+    
+    db = Chroma.from_texts(threat_intel_docs, embeddings)
+    print(f"{C.GRN}[OK] Local ChromaDB Vector Store successfully running in memory.{C.R}\n")
+    return db
+
+# =============================================================================
+#  LangGraph Multi-Agent Nodes (RAG + Active IPS)
 # =============================================================================
 
 class AgentState(TypedDict):
     raw_log: dict
     watchdog_rule: str
+    threat_intel_context: str
     analyst_hypothesis: str
     critic_rebuttal: str
     final_report: dict
     remediation_plan: dict
 
+def get_intel_retriever_node(db):
+    """Factory to safely access ChromaDB without locking the async runtime loop."""
+    async def intel_retriever_node(state: AgentState) -> dict:
+        query = f"Rule: {state['watchdog_rule']} Port: {state['raw_log'].get('destination_port')}"
+        # Execute blocking database search safely within an execution thread
+        docs = await asyncio.to_thread(db.similarity_search, query, k=2)
+        context = "\n- " + "\n- ".join([d.page_content for d in docs])
+        return {"threat_intel_context": context}
+    return intel_retriever_node
+
 async def analyst_node(state: AgentState) -> dict:
     llm = ChatOllama(model=ANALYST_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1)
-    prompt = f"""Rule Triggered: {state['watchdog_rule']}
+    prompt = f"""You are an expert SOC Analyst. A deterministic Watchdog flagged this log:
+    Rule Triggered: {state['watchdog_rule']}
     Raw Data: {json.dumps(state['raw_log'], default=str)}
-    In exactly 2 sentences, state your hypothesis on why this represents a malicious attack."""
+    
+    Retrieved Threat Intel Context: {state['threat_intel_context']}
+    
+    In exactly 2 sentences, state your hypothesis on why this represents a malicious attack. Ground your reasoning explicitly on data patterns found in the Threat Intel."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    return {"analyst_hypothesis": response.content.strip()}
+    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
+    return {"analyst_hypothesis": content}
 
 async def critic_node(state: AgentState) -> dict:
     llm = ChatOllama(model=CRITIC_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.3)
-    prompt = f"""Raw Data: {json.dumps(state['raw_log'], default=str)}
+    prompt = f"""You are a Red Team Critic. Your job is to prevent false positives by challenging the Analyst.
+    Raw Data: {json.dumps(state['raw_log'], default=str)}
+    Retrieved Threat Intel Context: {state['threat_intel_context']}
     Analyst Hypothesis: {state['analyst_hypothesis']}
-    In exactly 2 sentences, play devil's advocate. Provide a plausible benign explanation for this traffic behavior."""
+    
+    In exactly 2 sentences, play devil's advocate. Provide a plausible benign explanation for this traffic behavior by mapping it to safe baselines described in the Threat Intel."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
-    return {"critic_rebuttal": response.content.strip()}
+    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
+    return {"critic_rebuttal": content}
 
 async def judge_node(state: AgentState) -> dict:
     llm = ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.0, format="json")
-    prompt = f"""Raw Data: {json.dumps(state['raw_log'], default=str)}
+    prompt = f"""You are the Lead SOC Judge. Evaluate the debate and issue a final ruling.
+    Raw Data: {json.dumps(state['raw_log'], default=str)}
     Analyst Argues: {state['analyst_hypothesis']}
     Critic Argues: {state['critic_rebuttal']}
-    Output a JSON object: {{"is_threat": bool, "threat_type": str, "justification": str}}."""
+    
+    Output your final verdict strictly as a JSON object with these exact keys:
+    "is_threat" (boolean), "threat_type" (string, or "False Positive"), "justification" (1 sentence explaining who won the debate)."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
+    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
+    
     try:
-        report = json.loads(response.content.strip())
+        report = json.loads(content)
     except json.JSONDecodeError:
-        report = {"is_threat": True, "threat_type": "Parse Error", "justification": "Failed to parse Judge output."}
+        report = {"is_threat": True, "threat_type": "Parse Error", "justification": "Failed to parse Judge JSON output."}
     return {"final_report": report}
 
 async def remediation_node(state: AgentState) -> dict:
     llm = ChatOllama(model=REMEDIATION_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.0, format="json")
-    prompt = f"""Raw Data: {json.dumps(state['raw_log'], default=str)}
+    prompt = f"""You are a SOC Mitigation Engineer. 
+    Raw Data: {json.dumps(state['raw_log'], default=str)}
     Judge Verdict: {json.dumps(state['final_report'], default=str)}
-    Output a JSON object: {{"firewall_command": str, "rollback_command": str, "risk_warning": str}}."""
+    
+    Generate active containment scripts for this threat.
+    Output a strict JSON object with these exact keys:
+    "firewall_command" (A string containing a valid Linux `iptables` or `ufw` command to block or rate-limit the offending traffic).
+    "rollback_command" (The bash command to undo the block).
+    "risk_warning" (1 sentence detailing the structural impact of deploying this block)."""
     
     response = await llm.ainvoke([HumanMessage(content=prompt)])
+    content = response.content.split('</think>')[-1].strip() if '</think>' in response.content else response.content.strip()
+    
     try:
-        plan = json.loads(response.content.strip())
+        plan = json.loads(content)
     except json.JSONDecodeError:
-        plan = {"firewall_command": "echo 'Parse Error'", "rollback_command": "echo 'Error'", "risk_warning": "Parse Error"}
+        plan = {"firewall_command": "echo 'Containment Error'", "rollback_command": "echo 'N/A'", "risk_warning": "Parse Error"}
     return {"remediation_plan": plan}
 
 def router(state: AgentState) -> Literal["remediation", "__end__"]:
@@ -156,14 +213,17 @@ def router(state: AgentState) -> Literal["remediation", "__end__"]:
         return "remediation"
     return "__end__"
 
-def build_soc_graph():
+def build_soc_graph(db):
     workflow = StateGraph(AgentState)
+    
+    workflow.add_node("intel_retriever", get_intel_retriever_node(db))
     workflow.add_node("analyst", analyst_node)
     workflow.add_node("critic", critic_node)
     workflow.add_node("judge", judge_node)
     workflow.add_node("remediation", remediation_node)
     
-    workflow.add_edge(START, "analyst")
+    workflow.add_edge(START, "intel_retriever")
+    workflow.add_edge("intel_retriever", "analyst")
     workflow.add_edge("analyst", "critic")
     workflow.add_edge("critic", "judge")
     workflow.add_conditional_edges("judge", router, {"remediation": "remediation", "__end__": END})
@@ -171,13 +231,16 @@ def build_soc_graph():
     
     return workflow.compile()
 
+# =============================================================================
+#  Output Presentation & Log Handlers
+# =============================================================================
 def print_debate_report(log: dict, rule: str, state: dict, line_no: int, report_id: int):
     W = 72
     fat = "=" * W
     mid = "-" * W
 
     print(f"\n{C.YLW}{C.B}{fat}{C.R}")
-    print(f"{C.YLW}{C.B}  [!!] FINE-TUNED DEBATE REPORT #{report_id}   |  stream line {line_no:,}{C.R}")
+    print(f"{C.YLW}{C.B}  [!!] LANGGRAPH RAG DEBATE REPORT #{report_id}   |  line {line_no:,}{C.R}")
     print(f"{C.YLW}{mid}{C.R}")
 
     print(f"{C.CYN}  Timestamp          {C.WHT}{log.get('timestamp', 'N/A')}{C.R}")
@@ -186,6 +249,9 @@ def print_debate_report(log: dict, rule: str, state: dict, line_no: int, report_
     print(f"{C.CYN}  Alert Rule         {C.MAG}{rule}{C.R}")
 
     print(f"{C.YLW}{mid}{C.R}")
+    print(f"{C.MAG}{C.B}  [VDB THREAT INTELLIGENCE INJECTED] {C.R}{C.WHT}{state.get('threat_intel_context', '')}{C.R}")
+    print(f"{C.YLW}{mid}{C.R}")
+    
     print(f"{C.RED}{C.B}  [ANALYST ({ANALYST_MODEL})]  {C.R}{C.WHT}{state.get('analyst_hypothesis', '')}{C.R}\n")
     print(f"{C.BLU}{C.B}  [CRITIC ({CRITIC_MODEL})]    {C.R}{C.WHT}{state.get('critic_rebuttal', '')}{C.R}")
     print(f"{C.YLW}{mid}{C.R}")
@@ -208,7 +274,7 @@ def print_debate_report(log: dict, rule: str, state: dict, line_no: int, report_
     print(f"{C.YLW}{C.B}{fat}{C.R}\n")
 
 # =============================================================================
-#  Async Producer-Consumer Infrastructure
+#  Async Producer-Consumer Pipeline Execution Infrastructure
 # =============================================================================
 class _Counters:
     __slots__ = ("total_scanned", "total_flagged", "parse_errors", "reports_generated")
@@ -243,7 +309,7 @@ async def producer_task(queue: asyncio.Queue, watchdog: WatchdogAgent, counters:
                     rate = counters.total_flagged / counters.total_scanned * 100
                     print(f"{C.D}  [~] Scanned {counters.total_scanned:>10,}  |  Flagged {counters.total_flagged:>7,}  |  Rate {rate:.3f}%{C.R}", flush=True)
     except OSError as exc:
-        print(f"{C.RED}[FATAL] File I/O error in producer: {exc}{C.R}")
+        print(f"{C.RED}[FATAL] Ingestion Pipeline stream fail: {exc}{C.R}")
         raise
 
 async def worker_task(queue: asyncio.Queue, soc_graph, counters: _Counters) -> None:
@@ -257,6 +323,7 @@ async def worker_task(queue: asyncio.Queue, soc_graph, counters: _Counters) -> N
             initial_state = {
                 "raw_log": record,
                 "watchdog_rule": rule_desc,
+                "threat_intel_context": "",
                 "analyst_hypothesis": "",
                 "critic_rebuttal": "",
                 "final_report": {},
@@ -264,23 +331,22 @@ async def worker_task(queue: asyncio.Queue, soc_graph, counters: _Counters) -> N
             }
             
             final_state = await soc_graph.ainvoke(initial_state)
-            
             counters.reports_generated += 1
             print_debate_report(record, rule_desc, final_state, line_no, counters.reports_generated)
 
         except Exception as exc:
-            _warn(f"Worker error on line {line_no} — {type(exc).__name__}: {exc}")
+            _warn(f"Orchestration thread trace failure on log line {line_no} — {exc}")
         finally:
             queue.task_done()
 
-async def async_main(watchdog: WatchdogAgent, counters: _Counters) -> None:
+async def async_main(watchdog: WatchdogAgent, counters: _Counters, db) -> None:
     queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-    soc_graph = build_soc_graph()
+    soc_graph = build_soc_graph(db)
     workers: list[asyncio.Task] = []
 
     try:
         workers = [
-            asyncio.create_task(worker_task(queue, soc_graph, counters), name=f"langgraph-worker-{i}")
+            asyncio.create_task(worker_task(queue, soc_graph, counters), name=f"soc-worker-{i}")
             for i in range(NUM_WORKERS)
         ]
         await producer_task(queue, watchdog, counters)
@@ -292,56 +358,36 @@ async def async_main(watchdog: WatchdogAgent, counters: _Counters) -> None:
         for w in workers: w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
 
-# =============================================================================
-#  Utility & Main Loop
-# =============================================================================
 def _warn(msg: str) -> None:
     print(f"{C.YLW}{C.D}  [W]  {msg}{C.R}", file=sys.stderr, flush=True)
 
-def _print_summary(total: int, flagged: int, watch: WatchdogAgent, elapsed: float, errors: int, reports: int) -> None:
-    flag_pct   = (flagged / total  * 100) if total   else 0.0
-    throughput = (total   / elapsed)      if elapsed else 0.0
-    W = 72
-    def stat(label: str, value: str, col: str = C.WHT): print(f"  {C.WHT}{label:<40}{col}{value}{C.R}")
-
-    print(f"\n{C.GRN}{C.B}{'=' * W}{C.R}")
-    print(f"{C.GRN}{C.B}  ORCHESTRATION COMPLETE  -  SUMMARY STATISTICS{C.R}")
-    print(f"{C.GRN}{'-' * W}{C.R}")
-    stat("Total Logs Scanned", f"{total:>14,}")
-    stat("Total Logs Flagged", f"{flagged:>14,}", C.YLW)
-    stat("Overall Flag Rate", f"{flag_pct:>13.3f}%", C.YLW)
-    stat("Rule-1 Hits  (Volumetric)", f"{watch.rule1_hits:>14,}", C.CYN)
-    stat("Rule-2 Hits  (TLS/DoH Tunnel)", f"{watch.rule2_hits:>14,}", C.CYN)
-    stat("Graph Debates Completed", f"{reports:>14,}", C.MAG)
-    stat("JSON Parse Errors Skipped", f"{errors:>14,}", C.RED if errors else C.WHT)
-    stat("Total Elapsed Time", f"{elapsed:>13.2f}s")
-    stat("Average Throughput", f"{throughput:>8,.0f} logs/sec")
-    print(f"{C.GRN}{'=' * W}{C.R}\n")
-
 def main() -> None:
     W = 76
-    print(f"\n{C.GRN}{C.B}\u2554{'='*(W-2)}\u2557\n\u2551{' '*2}AUTONOMOUS MULTI-AGENT THREAT INTELLIGENCE SYSTEM{' '*(W-53)}\u2551\n\u2551{' '*2}Phase 5  -  Fine-Tuned Specialized Gemma Ensemble{' '*(W-49)}\u2551\n\u255a{'='*(W-2)}\u255d{C.R}\n")
+    print(f"\n{C.GRN}{C.B}\u2554{'='*(W-2)}\u2557\n\u2551{' '*2}AUTONOMOUS MULTI-AGENT THREAT INTELLIGENCE SYSTEM{' '*(W-53)}\u2551\n\u2551{' '*2}Phase 6  -  Vector Store RAG & Active System Remediation{' '*(W-59)}\u2551\n\u255a{'='*(W-2)}\u255d{C.R}\n")
 
     if not os.path.isfile(LOG_FILE):
-        print(f"{C.RED}{C.B}[FATAL] Log file not found: {LOG_FILE}{C.R}")
+        print(f"{C.RED}{C.B}[FATAL] Log target data file missing: {LOG_FILE}{C.R}")
         sys.exit(1)
 
-    print(f"{C.GRN}[OK] Agents initialised — {NUM_WORKERS} async LangGraph worker(s) using Gemma Fine-Tunes{C.R}\n")
+    # Boot database locally using Ollama embedding driver
+    db = initialize_threat_intel_db()
+
+    print(f"{C.GRN}[OK] Pipeline online — Multi-Model Air-Gapped Swarm ready.{C.R}\n")
     
     watchdog = WatchdogAgent()
     counters = _Counters()
     t0 = time.perf_counter()
 
     try:
-        asyncio.run(async_main(watchdog, counters))
+        asyncio.run(async_main(watchdog, counters, db))
     except KeyboardInterrupt:
-        print(f"\n{C.YLW}{C.B}[!] Interrupted by user (Ctrl-C) — printing partial summary.{C.R}")
-    except OSError as exc:
-        print(f"{C.RED}[FATAL] File I/O error: {exc}{C.R}")
-        sys.exit(1)
+        print(f"\n{C.YLW}{C.B}[!] Process terminated via keyboard interruption flag.{C.R}")
     finally:
         elapsed = time.perf_counter() - t0
-        _print_summary(counters.total_scanned, counters.total_flagged, watchdog, elapsed, counters.parse_errors, counters.reports_generated)
+        # Print end metrics block
+        print(f"\n{C.GRN}{C.B}{'=' * 72}{C.R}")
+        print(f"  Execution Time: {elapsed:.2f}s  |  Scanned Logs: {counters.total_scanned:,}  |  Debates: {counters.reports_generated}")
+        print(f"{C.GRN}{'=' * 72}{C.R}\n")
 
 if __name__ == "__main__":
     main()
