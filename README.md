@@ -5,7 +5,7 @@
 [![Ollama](https://img.shields.io/badge/Ollama-Local_LLMs-black.svg)](https://ollama.com/)
 [![ChromaDB](https://img.shields.io/badge/Vector_DB-Chroma-12D2A5.svg)](https://www.trychroma.com/)
 
-An air-gapped, multi-agent Intrusion Prevention System (IPS) that leverages localized Large Language Models (LLMs) and Retrieval-Augmented Generation (RAG) to dynamically analyze network traffic, debate threat hypotheses, and generate active firewall mitigations with near-zero false positives.
+An air-gapped, multi-agent Intrusion Prevention System (IPS) that leverages localized Large Language Models (LLMs) and Retrieval-Augmented Generation (RAG) to dynamically analyze network traffic, debate threat hypotheses, and generate active firewall mitigations.
 
 ## 📖 Executive Summary
 Modern Security Operations Centers (SOCs) suffer from severe alert fatigue due to deterministic Intrusion Detection Systems (IDS). This project introduces a **two-tier architecture**:
