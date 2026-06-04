@@ -1,2 +1,5 @@
 env/
-*jsonl
+*.jsonl
+*.txt
+Flowcharts/
+.DS_Store

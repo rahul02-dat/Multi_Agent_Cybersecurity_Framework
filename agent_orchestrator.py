@@ -284,11 +284,32 @@ class _Counters:
         self.parse_errors:  int = 0
         self.reports_generated: int = 0
 
+BOOKMARK_FILE = "bookmark.txt"
+
 async def producer_task(queue: asyncio.Queue, watchdog: WatchdogAgent, counters: _Counters) -> None:
+    # 1. Check for previous batch history
+    start_line = 0
+    if os.path.exists(BOOKMARK_FILE):
+        with open(BOOKMARK_FILE, "r") as bf:
+            saved_val = bf.read().strip()
+            start_line = int(saved_val) if saved_val.isdigit() else 0
+            if start_line > 0:
+                print(f"{C.CYN}[*] Resuming Batch from line {start_line:,}...{C.R}")
+
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as fh:
             for line_no, raw in enumerate(fh, start=1):
+                
+                # Fast-forward to where the last batch ended
+                if line_no <= start_line:
+                    continue
+
                 if line_no % YIELD_EVERY == 0: await asyncio.sleep(0)
+
+                # Save our progress every 50 lines so Ctrl+C is safe
+                if line_no % 50 == 0:
+                    with open(BOOKMARK_FILE, "w") as bf:
+                        bf.write(str(line_no))
 
                 raw = raw.strip()
                 if not raw: continue
@@ -308,8 +329,9 @@ async def producer_task(queue: asyncio.Queue, watchdog: WatchdogAgent, counters:
                 if counters.total_scanned % PROGRESS_EVERY == 0:
                     rate = counters.total_flagged / counters.total_scanned * 100
                     print(f"{C.D}  [~] Scanned {counters.total_scanned:>10,}  |  Flagged {counters.total_flagged:>7,}  |  Rate {rate:.3f}%{C.R}", flush=True)
+                    
     except OSError as exc:
-        print(f"{C.RED}[FATAL] Ingestion Pipeline stream fail: {exc}{C.R}")
+        print(f"{C.RED}[FATAL] File I/O error in producer: {exc}{C.R}")
         raise
 
 async def worker_task(queue: asyncio.Queue, soc_graph, counters: _Counters) -> None:
