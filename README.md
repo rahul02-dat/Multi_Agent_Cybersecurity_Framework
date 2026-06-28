@@ -12,7 +12,7 @@ Modern Security Operations Centers (SOCs) suffer from severe alert fatigue due t
 1. **Algorithmic Triage:** A high-speed heuristic Watchdog processes raw network traffic to filter benign events.
 2. **Adversarial AI Swarm:** Flagged anomalies are routed to a LangGraph-orchestrated LLM swarm running natively via Ollama. An **Analyst** agent proposes a threat theory, a **Critic** acts as a Red Team "Devil's Advocate" to find benign explanations, and a **Judge** arbitrates the debate to deploy active Bash/Firewall mitigation scripts.
 
-All agent reasoning is strictly grounded by a **ChromaDB Vector Store** containing textbook threat intelligence, completely eliminating LLM hallucinations.
+All agent reasoning is strictly grounded by a **ChromaDB Vector Store** containing textbook threat intelligence, minimizing LLM hallucinations.
 
 ---
 
